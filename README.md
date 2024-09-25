@@ -1,2 +1,2 @@
-# quantseq_pbmc
-QuantSeq PBMC stimulation paper
+# QuantSeq of pathogen-stimulated PBMCs
+QuantSeq PBMC stimulation paper public code
