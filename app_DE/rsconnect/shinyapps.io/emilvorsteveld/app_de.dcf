@@ -1,0 +1,10 @@
+name: app_de
+title:
+username: emilvorsteveld
+account: emilvorsteveld
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 13990064
+bundleId: 9795403
+url: https://emilvorsteveld.shinyapps.io/app_de/
+version: 1

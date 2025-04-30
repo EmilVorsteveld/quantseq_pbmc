@@ -1,0 +1,3563 @@
+---
+author: "E.E. Vorsteveld"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Packages and functions
+```{r}
+library(tidyverse)
+library(here)
+library(venn)
+library(rlist)
+library(DESeq2)
+library(DEFormats)
+library(reshape2)
+library(corrplot)
+library(RColorBrewer)
+library(factoextra)
+library(limma)
+library(msigdbr)
+library(fgsea)
+library(org.Hs.eg.db)
+library(glue)
+library(ggrepel)
+library(ggpubr)
+library(correlationAnalyzeR)
+library(matrixcalc)
+library(scales)
+library(gtools)
+library(ggrepel)
+library(ggh4x)
+library(UpSetR)
+library(ggtext)
+
+source(here::here("functions/fgseaFromdds.R"))
+source(here::here("functions/fisherGeneList.R"))
+source(here::here("functions/jaccard.R"))
+source(here::here("functions/mRNA_function.R"))
+source(here::here("functions/getGenes.R"))
+source(here::here("functions/fixTimeOrder.R"))
+source(here::here("functions/fixClassOrder.R"))
+source(here::here("functions/fixConditionOrder.R"))
+source(here::here("functions/getDataForGSEAPlot.R"))
+source(here::here("functions/GSEASimple.R"))
+source(here::here("functions/addTranscript.R"))
+```
+
+# Setup
+Metadata
+```{r}
+seq_data <- here::here("data/seq_data")
+
+#Annotation file available from ensembl: https://www.ensembl.org/Homo_sapiens/Info/Index
+ref_annot <- read.table(here("data/Homo_sapiens.GRCh38.95_nodupes_genid.txt"), header = TRUE, sep = "\t")
+
+metadat <- read.csv(here("data/Phenodata.txt"), header = TRUE, sep = "\t")
+row.names(metadat) <- metadat$id
+```
+
+Generating a DESeq dataset
+```{r}
+sampleTable_4hr <- data.frame(sampleName = (metadat[grep("*_4hr", metadat$id), ]$id), 
+                              fileName = (gsub("$", ".counts.txt", 
+                                               (metadat[grep("*_4hr", metadat$id), ]$id))), 
+                              stimulus = (metadat[grep("*_4hr", metadat$id), ]$stimulus), 
+                              donor = (metadat[grep("*_4hr", metadat$id), ]$donor), 
+                              time_point = (metadat[grep("*_4hr", metadat$id), ]$time))
+
+sampleTable_24hr <- data.frame(sampleName = (metadat[grep("*_24hr", metadat$id), ]$id), 
+                               fileName = (gsub("$", ".counts.txt", 
+                                                (metadat[grep("*_24hr", metadat$id), ]$id))), 
+                               stimulus = (metadat[grep("*_24hr", metadat$id), ]$stimulus), 
+                               donor = (metadat[grep("*_24hr", metadat$id), ]$donor), 
+                               time_point = (metadat[grep("*_24hr", metadat$id), ]$time))
+
+sampleTable_list <- list()
+sampleTable_list <- rlist::list.append(sampleTable_list, "sampleTable_4hr")
+sampleTable_list <- rlist::list.append(sampleTable_list, "sampleTable_24hr")
+
+opt.time <- c("4hr", "24hr")
+#opt.donors <- c("A", "B", "C", "D", "E")
+
+ddsHTSeq_list <- list()
+ddsHTSeq_list <- rlist::list.append(ddsHTSeq_list, "ddsHTSeq_4hrs")
+ddsHTSeq_list <- rlist::list.append(ddsHTSeq_list, "ddsHTSeq_24hrs")
+
+makeDESeqDataSet <- function(t){
+  DESeqDataSetFromHTSeqCount(sampleTable = t, directory = seq_data, design = ~ donor + stimulus)
+}
+
+for (i in 1:length(sampleTable_list)){
+  assign(as.character(ddsHTSeq_list[[i]][1]),
+         makeDESeqDataSet(
+           get(as.character(sampleTable_list[[i]][1]), envir = globalenv())
+           )
+         )
+}
+```
+
+Filter based on rowsums
+```{r}
+keepFromddsHTSeq <- function(t){
+  keep <- rowSums(counts(t)) >= 10
+  t[keep, ]
+}
+
+for (i in 1:length(ddsHTSeq_list)){
+  assign(as.character(ddsHTSeq_list[[i]][1]),
+         keepFromddsHTSeq(
+           get(as.character(ddsHTSeq_list[[i]][1]), envir = globalenv()))
+         )
+}
+```
+
+Remove mtrRNA, mttRNA, snRNA, snoRNA, miscRNA and lincRNA genes
+```{r}
+#Apply the mRNA filtering function to the list of ddsHTSeq objects
+for (i in 1:length(ddsHTSeq_list)){
+  assign(as.character(ddsHTSeq_list[[i]][1]),
+         mRNA_function(get(
+           as.character(ddsHTSeq_list[[i]][1]), envir = globalenv())
+                       )
+         )
+} 
+```
+
+Differential expression analysis
+```{r}
+source(here::here("functions/diffExpression.R"))
+
+dds_list <- list()
+dds_list <- list.append(dds_list, "dds_4hr")
+dds_list <- list.append(dds_list, "dds_24hr")
+
+#Apply the diffExpression function to the list of ddsHTSeq objects
+for (i in 1:length(ddsHTSeq_list)){
+  assign(as.character(dds_list[[i]][1]),
+         diffExpression(get(as.character(ddsHTSeq_list[[i]][1]), envir = globalenv()))
+         )
+}
+```
+
+log-fold shrinkage of the result from DESeq
+```{r}
+source(here("functions/logFoldShrinkage.R"))
+library(apeglm)
+
+opt.cond.long <- c("group_LPS_vs_RPMI", 
+                   "group_S_Aureus_vs_RPMI", 
+                   "group_PolyIC_vs_RPMI", 
+                   "group_C_Albicans_vs_RPMI")
+
+saveRDS(opt.cond.long, here("Donor/opt_cond_long.rda"))
+opt.cond.long <- readRDS(here("Donor/opt_cond_long.rda"))
+
+resLFC4hrLPS <-         logFoldShrinkage(dds_4hr, opt.cond.long[1])
+resLFC4hrSAur <-        logFoldShrinkage(dds_4hr, opt.cond.long[2])
+resLFC4hrPolIC <-       logFoldShrinkage(dds_4hr, opt.cond.long[3])
+resLFC4hrCAlb <-        logFoldShrinkage(dds_4hr, opt.cond.long[4])
+
+resLFC24hrLPS <-        logFoldShrinkage(dds_24hr, opt.cond.long[1])
+resLFC24hrSAur <-       logFoldShrinkage(dds_24hr, opt.cond.long[2])
+resLFC24hrPolIC <-      logFoldShrinkage(dds_24hr, opt.cond.long[3])
+resLFC24hrCAlb <-       logFoldShrinkage(dds_24hr, opt.cond.long[4])
+```
+
+Generating a masterfile
+```{r}
+opt.time <- c("4hr", "24hr")
+resLFC_list <- list()
+
+for (time in opt.time){
+  for (cond in opt.cond){ 
+  name <- as.character(paste0("resLFC", time, cond))
+
+  resLFC_list <- list.append(name, resLFC_list)
+
+  t <- get(name)
+  assign(name,
+         as.data.frame(t) %>% 
+           mutate(time = time) %>% 
+           mutate(condition = cond) %>% 
+    addTranscript()
+    )
+    
+  }
+}
+
+Masterfile <- do.call(rbind, lapply(resLFC_list, get)) %>%     
+  mutate(direction = ifelse(log2FoldChange > 0, "up", ifelse(log2FoldChange < 0, "down", NA))) 
+
+Masterfile_padj <- Masterfile %>% subset(log2FoldChange >= 1 & log2FoldChange > 0 | log2FoldChange <= -1 & log2FoldChange < 0) %>% subset(padj < 0.01)
+```
+
+# Gene body coverage (Figure S1)
+For generating the gene body coverage statistics see: RESeQCoverage.sh
+```{r}
+coverage_files <- list.files(here::here("data/gene_body_coverage"), pattern = "txt")
+coverage <- list()
+
+for (i in 1:length(coverage_files)) {
+  dat <- read.delim(paste0(here::here("data/gene_body_coverage/"), coverage_files[i]), 
+                           sep = "\t", header = T) 
+  dat <- dat %>% 
+    melt(id.vars = "Percentile")
+  dat$value <- scales::rescale(dat$value)
+  
+  coverage <- rlist::list.append(
+    coverage,
+    dat
+  )
+}
+
+coverage <- do.call(rbind, coverage)
+
+coverage$variable <- as.character(coverage$variable)
+coverage$percentile <- 0
+
+for (i in 1:nrow(coverage)) {
+  coverage$percentile[i] <- as.numeric(substr(as.character(coverage$variable[i]), 2, nchar(as.character(coverage$variable[i]))))
+}
+coverage$percentile <- as.numeric(coverage$percentile)
+colnames(coverage) <- c("sample", "id", "value", "percentile")
+
+
+coverage %>% 
+  ggplot(aes(x = percentile, y = value, color = sample)) +
+  geom_line(size = 0.2) +
+  labs(x = "Gene body percentile (5'->3')",
+       y = "Coverage",
+       color = "Sample") +
+  scale_color_viridis_d() +
+  theme_bw() +
+  theme(legend.position="bottom",
+        text = element_text(size = 16),
+        legend.text = element_text(size = 10))
+```
+
+# Gene expression correlation (Figure S2A-D)
+```{r}
+directory <- here::here("data/seq_data")
+A1 <- read.csv(paste0(directory, "/A1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+A1_repl <- read.csv(paste0(directory, "/A1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+A6 <- read.csv(paste0(directory, "/A6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1 <- read.csv(paste0(directory, "/B1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1_repl <- read.csv(paste0(directory, "/B1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B6 <- read.csv(paste0(directory, "/B6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1 <- read.csv(paste0(directory, "/C1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1_repl <- read.csv(paste0(directory, "/C1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C6 <- read.csv(paste0(directory, "/C6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1 <- read.csv(paste0(directory, "/D1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1_repl <- read.csv(paste0(directory, "/D1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D6 <- read.csv(paste0(directory, "/D6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1 <- read.csv(paste0(directory, "/E1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1_repl <- read.csv(paste0(directory, "/E1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E6 <- read.csv(paste0(directory, "/E6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+
+colnames(A1) <- c("Transcript ID", "A1")
+colnames(A1_repl) <- c("Transcript ID", "A1_repl")
+colnames(A6) <- c("Transcript ID", "A6")
+colnames(B1) <- c("Transcript ID", "B1")
+colnames(B1_repl) <- c("Transcript ID", "B1_repl")
+colnames(B6) <- c("Transcript ID", "B6")
+colnames(C1) <- c("Transcript ID", "C1")
+colnames(C1_repl) <- c("Transcript ID", "C1_repl")
+colnames(C6) <- c("Transcript ID", "C6")
+colnames(D1) <- c("Transcript ID", "D1")
+colnames(D1_repl) <- c("Transcript ID", "D1_repl")
+colnames(D6) <- c("Transcript ID", "D6")
+colnames(E1) <- c("Transcript ID", "E1")
+colnames(E1_repl) <- c("Transcript ID", "E1_repl")
+colnames(E6) <- c("Transcript ID", "E6")
+
+
+merge_A <- inner_join(A1, A1_repl, by="Transcript ID") 
+merge_A <- inner_join(merge_A, A6, by="Transcript ID") 
+
+merge_B <- inner_join(B1, B1_repl, by="Transcript ID") 
+merge_B <- inner_join(merge_B, B6, by="Transcript ID") 
+
+merge_C <- inner_join(C1, C1_repl, by="Transcript ID") 
+merge_C <- inner_join(merge_C, C6, by="Transcript ID") 
+
+merge_D <- inner_join(D1, D1_repl, by="Transcript ID") 
+merge_D <- inner_join(merge_D, D6, by="Transcript ID") 
+
+merge_E <- inner_join(E1, E1_repl, by="Transcript ID") 
+merge_E <- inner_join(merge_E, E6, by="Transcript ID") 
+
+Merge_4hr <- inner_join(merge_A, merge_B, by="Transcript ID")
+Merge_4hr <- inner_join(Merge_4hr, merge_C, by="Transcript ID")
+Merge_4hr <- inner_join(Merge_4hr, merge_D, by="Transcript ID")
+Merge_4hr <- inner_join(Merge_4hr, merge_E, by="Transcript ID")
+Merge_4hr
+
+rownames(Merge_4hr) <- Merge_4hr$`Transcript ID`
+Merge_4hr <- dplyr::select(Merge_4hr, -`Transcript ID`)
+
+Merge_4hr_corr <- cor(Merge_4hr)
+
+
+Merge_4hr_corr_plot <- corrplot(Merge_4hr_corr, 
+                                method="number", type="upper", tl.col="black", number.cex=0.5, 
+                                col= rev(brewer.pal(n=8, name="RdBu")))
+
+Merge_4hr_corr_plot
+
+corrplot(Merge_4hr_corr, 
+         method="number", type="upper", tl.col="black", number.cex=0.5, 
+         col= rev(brewer.pal(n=8, name="RdBu")))
+```
+
+```{r}
+#-- Technical replicate correlation matrix plot
+
+A1.1 <- read.csv(paste0(directory, "/A1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+A1.2 <- read.csv(paste0(directory, "/A1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1.1 <- read.csv(paste0(directory, "/B1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1.2 <- read.csv(paste0(directory, "/B1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1.1 <- read.csv(paste0(directory, "/C1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1.2 <- read.csv(paste0(directory, "/C1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1.1 <- read.csv(paste0(directory, "/D1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1.2 <- read.csv(paste0(directory, "/D1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1.1 <- read.csv(paste0(directory, "/E1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1.2 <- read.csv(paste0(directory, "/E1_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+
+
+colnames(A1.1) <- c("Transcript ID", "A1.1")
+colnames(A1.2) <- c("Transcript ID", "A1.2")
+colnames(B1.1) <- c("Transcript ID", "B1.1")
+colnames(B1.2) <- c("Transcript ID", "B1.2")
+colnames(C1.1) <- c("Transcript ID", "C1.1")
+colnames(C1.2) <- c("Transcript ID", "C1.2")
+colnames(D1.1) <- c("Transcript ID", "D1.1")
+colnames(D1.2) <- c("Transcript ID", "D1.2")
+colnames(E1.1) <- c("Transcript ID", "E1.1")
+colnames(E1.2) <- c("Transcript ID", "E1.2")
+
+
+merge_tech_A <- inner_join(A1.1, A1.2, by="Transcript ID") 
+merge_tech_B <- inner_join(B1.1, B1.2, by="Transcript ID") 
+merge_tech_C <- inner_join(C1.1, C1.2, by="Transcript ID") 
+merge_tech_D <- inner_join(D1.1, D1.2, by="Transcript ID") 
+merge_tech_E <- inner_join(E1.1, E1.2, by="Transcript ID") 
+
+
+Merge_tech_4hr <- inner_join(merge_tech_A, merge_tech_B, by="Transcript ID")
+Merge_tech_4hr <- inner_join(Merge_tech_4hr, merge_tech_C, by="Transcript ID")
+Merge_tech_4hr <- inner_join(Merge_tech_4hr, merge_tech_D, by="Transcript ID")
+Merge_tech_4hr <- inner_join(Merge_tech_4hr, merge_tech_E, by="Transcript ID")
+#Merge_tech_4hr
+
+rownames(Merge_tech_4hr) <- Merge_tech_4hr$`Transcript ID`
+Merge_tech_4hr <- dplyr::select(Merge_tech_4hr, -`Transcript ID`)
+
+Merge_tech_4hr_corr <- cor(Merge_tech_4hr)
+
+
+corrplot(Merge_tech_4hr_corr, method="number", type="upper", tl.col="black", number.cex=0.5, col= rev(brewer.pal(n=8, name="RdBu")))
+
+
+#-- Biological replicate correlation matrix plot
+
+A1.1 <- read.csv(paste0(directory, "/A1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+A1.3 <- read.csv(paste0(directory, "/A6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1.1 <- read.csv(paste0(directory, "/B1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+B1.3 <- read.csv(paste0(directory, "/B6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1.1 <- read.csv(paste0(directory, "/C1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+C1.3 <- read.csv(paste0(directory, "/C6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1.1 <- read.csv(paste0(directory, "/D1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+D1.3 <- read.csv(paste0(directory, "/D6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1.1 <- read.csv(paste0(directory, "/E1_RPMI_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+E1.3 <- read.csv(paste0(directory, "/E6_RPMI_repl_4hr_R1.counts.txt"), header = FALSE, sep="\t")
+
+
+colnames(A1.1) <- c("Transcript ID", "A1.1")
+colnames(A1.3) <- c("Transcript ID", "A1.3")
+colnames(B1.1) <- c("Transcript ID", "B1.1")
+colnames(B1.3) <- c("Transcript ID", "B1.3")
+colnames(C1.1) <- c("Transcript ID", "C1.1")
+colnames(C1.3) <- c("Transcript ID", "C1.3")
+colnames(D1.1) <- c("Transcript ID", "D1.1")
+colnames(D1.3) <- c("Transcript ID", "D1.3")
+colnames(E1.1) <- c("Transcript ID", "E1.1")
+colnames(E1.3) <- c("Transcript ID", "E1.3")
+
+merge_biol_A <- inner_join(A1.1, A1.3, by="Transcript ID") 
+merge_biol_B <- inner_join(B1.1, B1.3, by="Transcript ID") 
+merge_biol_C <- inner_join(C1.1, C1.3, by="Transcript ID") 
+merge_biol_D <- inner_join(D1.1, D1.3, by="Transcript ID") 
+merge_biol_E <- inner_join(E1.1, E1.3, by="Transcript ID") 
+
+Merge_biol_4hr <- inner_join(merge_biol_A, merge_biol_B, by="Transcript ID")
+Merge_biol_4hr <- inner_join(Merge_biol_4hr, merge_biol_C, by="Transcript ID")
+Merge_biol_4hr <- inner_join(Merge_biol_4hr, merge_biol_D, by="Transcript ID")
+Merge_biol_4hr <- inner_join(Merge_biol_4hr, merge_biol_E, by="Transcript ID")
+#Merge_biol_4hr
+
+rownames(Merge_biol_4hr) <- Merge_biol_4hr$`Transcript ID`
+Merge_biol_4hr <- dplyr::select(Merge_biol_4hr, -`Transcript ID`)
+
+Merge_biol_4hr_corr <-cor(Merge_biol_4hr)
+
+
+corrplot(Merge_biol_4hr_corr, method="number", type="lower", tl.col="black", number.cex=0.5, col= rev(brewer.pal(n=8, name="RdBu")))
+
+corrplot(Merge_biol_4hr_corr, 
+         method="number", type="lower", tl.col="black", number.cex=0.5, col= rev(brewer.pal(n=8, name="RdBu")))
+```
+
+Correlation matrix, separate for biological and technical replicates- 24 hours
+```{r}
+#-- Technical replicate correlation matrix plot
+
+A7.1 <- read.csv(paste0(directory, "/A7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+A7.2 <- read.csv(paste0(directory, "/A7_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+B7.1 <- read.csv(paste0(directory, "/B7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+B7.2 <- read.csv(paste0(directory, "/B7_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+C7.1 <- read.csv(paste0(directory, "/C7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+C7.2 <- read.csv(paste0(directory, "/C7_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+D7.1 <- read.csv(paste0(directory, "/D7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+D7.2 <- read.csv(paste0(directory, "/D7_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+E7.1 <- read.csv(paste0(directory, "/E7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+E7.2 <- read.csv(paste0(directory, "/E7_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+
+
+colnames(A7.1) <- c("Transcript ID", "A7.1")
+colnames(A7.2) <- c("Transcript ID", "A7.2")
+colnames(B7.1) <- c("Transcript ID", "B7.1")
+colnames(B7.2) <- c("Transcript ID", "B7.2")
+colnames(C7.1) <- c("Transcript ID", "C7.1")
+colnames(C7.2) <- c("Transcript ID", "C7.2")
+colnames(D7.1) <- c("Transcript ID", "D7.1")
+colnames(D7.2) <- c("Transcript ID", "D7.2")
+colnames(E7.1) <- c("Transcript ID", "E7.1")
+colnames(E7.2) <- c("Transcript ID", "E7.2")
+
+
+merge_tech_A <- inner_join(A7.1, A7.2, by="Transcript ID") 
+merge_tech_B <- inner_join(B7.1, B7.2, by="Transcript ID") 
+merge_tech_C <- inner_join(C7.1, C7.2, by="Transcript ID") 
+merge_tech_D <- inner_join(D7.1, D7.2, by="Transcript ID") 
+merge_tech_E <- inner_join(E7.1, E7.2, by="Transcript ID") 
+
+
+Merge_tech_24hr <- inner_join(merge_tech_A, merge_tech_B, by="Transcript ID")
+Merge_tech_24hr <- inner_join(Merge_tech_24hr, merge_tech_C, by="Transcript ID")
+Merge_tech_24hr <- inner_join(Merge_tech_24hr, merge_tech_D, by="Transcript ID")
+Merge_tech_24hr <- inner_join(Merge_tech_24hr, merge_tech_E, by="Transcript ID")
+#Merge_tech_24hr
+
+rownames(Merge_tech_24hr) <- Merge_tech_24hr$`Transcript ID`
+Merge_tech_24hr <- dplyr::select(Merge_tech_24hr, -`Transcript ID`)
+
+Merge_tech_24hr_corr <-cor(Merge_tech_24hr)
+
+
+corrplot(Merge_tech_24hr_corr, method="number", type="upper", tl.col="black", number.cex=0.7, col= rev(brewer.pal(n=8, name="RdBu")))
+
+corrplot(Merge_tech_24hr_corr, 
+         method="number", type="upper", tl.col="black", number.cex=0.7, col= rev(brewer.pal(n=8, name="RdBu")))
+
+#-- Biological replicate correlation matrix plot
+
+A7.1 <- read.csv(paste0(directory, "/A7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+A7.3 <- read.csv(paste0(directory, "/A12_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+B7.1 <- read.csv(paste0(directory, "/B7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+B7.3 <- read.csv(paste0(directory, "/B12_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+C7.1 <- read.csv(paste0(directory, "/C7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+C7.3 <- read.csv(paste0(directory, "/C12_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+D7.1 <- read.csv(paste0(directory, "/D7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+D7.3 <- read.csv(paste0(directory, "/D12_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+E7.1 <- read.csv(paste0(directory, "/E7_RPMI_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+E7.3 <- read.csv(paste0(directory, "/E12_RPMI_repl_24hr_R1.counts.txt"), header = FALSE, sep="\t")
+
+
+colnames(A7.1) <- c("Transcript ID", "A7.1")
+colnames(A7.3) <- c("Transcript ID", "A7.3")
+colnames(B7.1) <- c("Transcript ID", "B7.1")
+colnames(B7.3) <- c("Transcript ID", "B7.3")
+colnames(C7.1) <- c("Transcript ID", "C7.1")
+colnames(C7.3) <- c("Transcript ID", "C7.3")
+colnames(D7.1) <- c("Transcript ID", "D7.1")
+colnames(D7.3) <- c("Transcript ID", "D7.3")
+colnames(E7.1) <- c("Transcript ID", "E7.1")
+colnames(E7.3) <- c("Transcript ID", "E7.3")
+
+merge_biol_A <- inner_join(A7.1, A7.3, by="Transcript ID") 
+merge_biol_B <- inner_join(B7.1, B7.3, by="Transcript ID") 
+merge_biol_C <- inner_join(C7.1, C7.3, by="Transcript ID") 
+merge_biol_D <- inner_join(D7.1, D7.3, by="Transcript ID") 
+merge_biol_E <- inner_join(E7.1, E7.3, by="Transcript ID") 
+
+Merge_biol_24hr <- inner_join(merge_biol_A, merge_biol_B, by="Transcript ID")
+Merge_biol_24hr <- inner_join(Merge_biol_24hr, merge_biol_C, by="Transcript ID")
+Merge_biol_24hr <- inner_join(Merge_biol_24hr, merge_biol_D, by="Transcript ID")
+Merge_biol_24hr <- inner_join(Merge_biol_24hr, merge_biol_E, by="Transcript ID")
+#Merge_biol_24hr
+
+rownames(Merge_biol_24hr) <- Merge_biol_24hr$`Transcript ID`
+Merge_biol_24hr <- dplyr::select(Merge_biol_24hr, -`Transcript ID`)
+
+Merge_biol_24hr_corr <-cor(Merge_biol_24hr)
+
+
+corrplot(Merge_biol_24hr_corr, method="number", type="lower", tl.col="black", number.cex=0.7, col= rev(brewer.pal(n=8, name="RdBu")))
+
+corrplot(Merge_biol_24hr_corr, 
+         method="number", type="lower", tl.col="black", number.cex=0.7, col= rev(brewer.pal(n=8, name="RdBu")))
+```
+
+# Principal component analysis (Figure 1B and S10A-B)
+Generating a combined dds
+```{r}
+sampleFilesAll <- grep("*4hr_R1", list.files(here("data/seq_data")), value = TRUE)
+
+sampleTableAll <- data.frame(
+  sampleName = (metadat[grep("*4hr", metadat$id), ]$id), 
+  fileName = (gsub("$", ".counts.txt", (metadat[grep("*4hr", metadat$id), ]$id))), 
+  stimulus = (metadat[grep("*4hr", metadat$id), ]$stimulus), 
+  donor = (metadat[grep("*4hr", metadat$id), ]$donor), 
+  time_point = (metadat[grep("*4hr", metadat$id), ]$time)
+  )
+
+ddsHTSeq_All <- DESeqDataSetFromHTSeqCount(
+  sampleTable = sampleTableAll, 
+  directory = here::here("data/seq_data"), 
+  design = ~ donor + time_point + stimulus
+  )
+
+keep_All <- rowSums(counts(ddsHTSeq_All)) >= 10
+ddsHTSeq_All <- ddsHTSeq_All[keep_All, ]
+
+ddsHTSeq_All$stimulus <- relevel(ddsHTSeq_All$stimulus, ref="RPMI")
+#ddsAll <- DESeq(ddsHTSeq_All)
+
+#This is the data that will be used for the 4&24hrs PCAs
+ntd_All <- normTransform(ddsHTSeq_All)
+colData(ntd_All)
+
+#And data for the 4 and 24 hr situations separately
+ddsHTSeq_4hrs <- readRDS(here("output/ddsHTSeq_4hrs.rda"))
+ddsHTSeq_24hrs <- readRDS(here("output/ddsHTSeq_24hrs.rda"))
+```
+
+A theme for the PCA plots
+```{r}
+theme <- theme(panel.background = element_blank(),
+               panel.border=element_rect(fill=NA),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               strip.background=element_blank(),
+               axis.ticks=element_line(colour="black"),
+               plot.margin=unit(c(1,1,1,1),"line"),
+               #axis.text.x = element_text(vjust=0, size = 16, hjust = 0), 
+               #axis.text.y = element_text(vjust=1, size = 16, hjust=0),
+               text=element_text(size=24),
+               legend.position = "top",
+               legend.text = element_text(size=24)
+               )
+```
+
+Main PCA (Figure 1B)
+```{r}
+pcaData <- plotPCA(ntd_All, 
+                   intgroup=c("stimulus", "time_point"), 
+                   returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+PCA_4_24hrs_2 <-
+  ggplot(pcaData, aes(PC1, PC2, shape = time_point, color = stimulus)) +
+  geom_point(aes(), size=4) + 
+  scale_color_viridis_d(limits = c("RPMI", "C_Albicans", "LPS",  "PolyIC", "S_Aureus")) +
+  #geom_mark_ellipse(color = "black")+
+  ggtitle("PCA 4 and 24 hours") +
+  scale_x_continuous(limits = c(-50,50), expand=c(0,0))+
+  scale_y_continuous(limits = c(-50,50), expand=c(0,0))+
+  scale_shape_discrete(name = "Time-point")+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  theme
+
+PCA_4_24hrs_2
+```
+
+PCA 4 hours (Figure S10A)
+```{r}
+ntd_4hrs <- normTransform(ddsHTSeq_4hrs)
+colData(ntd_4hrs)
+
+pcaData <- plotPCA(ntd_4hrs, 
+                   intgroup=c("group"), 
+                   returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaData <- pcaData %>% mutate(donor = substr(name, 1, 1))
+
+
+PCA_4hrs <- pcaData %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color = group, shape = donor), size=4) + 
+  scale_color_viridis_d(limits = c("RPMI", "C_Albicans", "LPS",  "PolyIC", "S_Aureus")) +
+  ggtitle("PCA 4 hours") +
+  scale_x_continuous(limits = c(-50,50), expand=c(0,0))+
+  scale_y_continuous(limits = c(-50,50), expand=c(0,0))+
+  scale_shape_discrete(name = "Donor")+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+  guides(color = guide_legend(nrow=2, byrow=TRUE),
+         shape = guide_legend(nrow=2, byrow=TRUE)) +
+  theme +
+  theme(legend.text=element_text(size=14))
+```
+
+PCA 24 hrs (Figure S10B)
+```{r}
+ntd_24hrs<- normTransform(ddsHTSeq_24hrs)
+colData(ntd_24hrs)
+
+pcaData <- plotPCA(ntd_24hrs, 
+                   intgroup=c("group"), 
+                   returnData=TRUE
+                   )
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaData <- pcaData %>% mutate(donor = substr(name, 1, 1))
+
+PCA_24hrs <- pcaData %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color = group, shape = donor), size=4) + 
+  scale_color_viridis_d(limits = c("RPMI", "C_Albicans", "LPS",  "PolyIC", "S_Aureus")) +
+  ggtitle("PCA 24 hours") +
+  scale_x_continuous(limits = c(-60,50), expand=c(0,0))+
+  scale_y_continuous(limits = c(-50,50), expand=c(0,0))+
+  scale_shape_discrete(name = "Donor")+
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    guides(color = guide_legend(nrow=2, byrow=TRUE),
+         shape = guide_legend(nrow=2, byrow=TRUE)) +
+  theme +
+  theme(legend.text=element_text(size=14))
+```
+
+# Hierarchical clustering (Figure 1C and S3A-B)
+Preparation (Figure S3A-B)
+```{r}
+dds_4hr <- readRDS(here::here("output/dds_4hr.rda"))
+dds_24hr <- readRDS(here::here("output/dds_24hr.rda"))
+  
+set.seed(24)
+dds_all <- full_join(counts(dds_4hr) %>% as.data.frame() %>% tibble::rownames_to_column(), 
+                     counts(dds_24hr) %>% as.data.frame() %>% tibble::rownames_to_column(),
+                     by = "rowname") %>%
+  tibble::remove_rownames() %>% 
+  tibble::column_to_rownames("rowname") %>% 
+  na.omit() 
+
+t_t <- as.matrix(dds_all) 
+
+t_t <- DESeq2::vst(t_t)
+t_t <- t_t %>% 
+  as.data.frame()
+
+top500 <- head(order(rowVars(as.matrix(t_t)), decreasing = TRUE), 500)
+t_t <- as.matrix(t_t[top500,])
+ 
+degs_kmeans_genes_top500_rlog <- fviz_nbclust(t_t, kmeans, method = "wss") + 
+  theme(text = element_text(size = 20)) + ggtitle("Optimal number of clusters: Genes")
+
+degs_kmeans_samples_top500_rlog <- fviz_nbclust(t(t_t), kmeans, method = "wss") + 
+  theme(text = element_text(size = 20)) + ggtitle("Optimal number of clusters: Samples")
+```
+
+Clustering results (Figure 1C)
+```{r}
+annotation_df <- colnames(t_t) %>% as.data.frame() 
+colnames(annotation_df) <- "ID"
+annotation_df <- annotation_df %>% 
+  mutate(`Time-point` = str_split(ID, "_") %>% purrr::map_chr(.,3)) %>% 
+  mutate(`Time-point` = ifelse(`Time-point` == "repl", str_split(ID, "_") %>% purrr::map_chr(.,4), `Time-point`)) %>% 
+  mutate(`Condition` = str_split(ID, "_") %>% purrr::map_chr(.,2)) %>% 
+  mutate(Individual = substr(ID, 1, 1)) %>% 
+  tibble::column_to_rownames("ID") 
+
+individual_colors <- viridis::inferno(n=5)
+names(individual_colors) <- unique(annotation_df$Individual)
+
+condition_colors <- c("#3e1a51", "#478f8d", "#41528a", "#7dbc6b", "#f7ea4b")
+names(condition_colors) <- c("RPMI", "LPS", "Calbicans", "PolyIC", "Saureus")
+
+time_colors <- c("#d9dcd9", "#bdbccf")
+names(time_colors) <- unique(annotation_df$`Time-point`)
+
+
+ann_colors = list(Individual = individual_colors, `Time-point` = time_colors, Condition = condition_colors)
+
+
+heat <- pheatmap::pheatmap(t_t, cutree_rows = 6, cutree_cols = 6, show_rownames = F, fontsize = 14, cellheight=1.1,cellwidth=16, annotation_col = annotation_df, annotation_colors = ann_colors) 
+
+
+#Output for supplemental
+cluster_df_gene <- sort(cutree(heat$tree_row, k=6)) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+colnames(cluster_df_gene) <- c("gene", "cluster")
+
+cluster_df_sample <- sort(cutree(heat$tree_col, k=6)) %>% as.data.frame() %>% tibble::rownames_to_column("sample")
+colnames(cluster_df_sample) <- c("sample", "cluster")
+arrange(cluster_df_sample, sample)
+
+t_out <- t_t %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+t_out <- full_join(t_out,
+                   cluster_df_gene) %>% 
+  tibble::column_to_rownames("gene")
+```
+
+# Gene set co-regulation (Figuse S11A-B)
+Getting the data into shape
+```{r}
+dds_all <- full_join(counts(dds_4hr) %>% as.data.frame() %>% tibble::rownames_to_column(), 
+                     counts(dds_24hr) %>% as.data.frame() %>% tibble::rownames_to_column(),
+                     by = "rowname") %>% tibble::column_to_rownames("rowname") %>% mutate_if(is.character, as.numeric) 
+
+dds_all <- dds_all[!rowSums(dds_all < 10), ]
+cols <- as.data.frame(list(colnames(dds_all)), col.names = "id") %>% 
+  mutate(individual = substr(id, 1, 1)) %>% 
+  mutate(condition = str_split(id, "_", simplify = TRUE)[, 2]) %>% 
+  mutate(time = ifelse(str_split(id, "_", simplify = TRUE)[, 3] %in% c("4hr", "24hr"),
+                       str_split(id, "_", simplify = TRUE)[, 3],
+                       str_split(id, "_", simplify = TRUE)[, 4])) %>% 
+  mutate(cond_time = paste0(condition, "_", time))
+
+order <- c(
+  subset(cols, condition == "RPMI" & time == "4hr")$id,
+  subset(cols, condition == "LPS" & time == "4hr")$id,
+  subset(cols, condition == "Saureus" & time == "4hr")$id,
+  subset(cols, condition == "Calbicans" & time == "4hr")$id,
+  subset(cols, condition == "PolyIC" & time == "4hr")$id,
+  
+  subset(cols, condition == "RPMI" & time == "24hr")$id,
+  subset(cols, condition == "LPS" & time == "24hr")$id,
+  subset(cols, condition == "Saureus" & time == "24hr")$id,
+  subset(cols, condition == "Calbicans" & time == "24hr")$id,
+  subset(cols, condition == "PolyIC" & time == "24hr")$id
+)
+
+dds_all <- dds_all[, order]
+
+dds_norm <- limma::normalizeBetweenArrays(log2(dds_all), method="quantile")
+dds_norm <- dds_norm[order(rowMeans(dds_norm), decreasing=TRUE), ]
+dds_norm <- dds_norm[!apply(dds_norm, 1, function(row) all(is.na(row))), ]
+```
+
+Getting pathways and running geseca
+```{r}
+pathways <- msigdbr("Homo sapiens", category="C5") %>% subset(gs_subcat == "GO:BP")
+pathways <- split(as.character(pathways$ensembl_gene), pathways$gs_name)
+
+set.seed(1)
+gesecaRes <- geseca(
+  pathways = pathways,
+  E = dds_norm,
+  minSize = 100, 
+  maxSize = 500
+)
+gesecaRes_signif <- gesecaRes %>% subset(padj < 0.01)
+```
+
+Plotting the output (Figure S11A)
+```{r}
+plotGesecaTable(gesecaRes[1:20,], pathways, E = dds_norm)
+```
+
+Plotting examples (Figure S11B)
+```{r}
+plotCoregulationProfile(pathway=pathways[["GOBP_CYTOPLASMIC_TRANSLATION"]], 
+                        E=dds_norm, titles = order, conditions = sapply(order, function(t) str_split(t, "_") %>% purrr::map_chr(.,2)))
+
+plotCoregulationProfile(pathway=pathways[["GOBP_DEFENSE_RESPONSE_TO_OTHER_ORGANISM"]], 
+                        E=dds_norm, titles = order, conditions = sapply(order, function(t) str_split(t, "_") %>% purrr::map_chr(.,2)))
+
+plotCoregulationProfile(pathway=pathways[["GOBP_RESPONSE_TO_VIRUS"]], 
+                        E=dds_norm, titles = order, conditions = sapply(order, function(t) str_split(t, "_") %>% purrr::map_chr(.,2)))
+
+plotCoregulationProfile(pathway=pathways[["GOBP_INNATE_IMMUNE_RESPONSE"]], 
+                        E=dds_norm, titles = order, conditions = sapply(order, function(t) str_split(t, "_") %>% purrr::map_chr(.,2)))
+```
+
+# Gene set enrichment analysis (Figure 2A-G and S12A-E)
+Generate GSEA
+```{r}
+#C5 GO:BP available from GSEA: https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp
+pathways <- fgsea::gmtPathways(here::here("data/c5.go.bp.v7.5.symbols.gmt"))
+pathname <- "GO_BP"
+
+time <- "4hr"
+
+LPS_4 <- fgseaFromdds(dds_4hr, test = "LPS", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500,
+                      name = paste(pathname, "pathways enriched in LPS vs. RPMI at 4hrs"))
+
+PolyIC_4 <- fgseaFromdds(dds_4hr, test = "PolyIC", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                         name = paste(pathname, "pathways enriched in PolyIC vs. RPMI  at 4hrs"))
+
+CAlb_4 <- fgseaFromdds(dds_4hr, test = "C_Albicans", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                       name = paste(pathname, "pathways enriched in C. Albicans vs. RPMI at 4hrs"))
+
+SAur_4 <- fgseaFromdds(dds_4hr, test = "S_Aureus", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                       name = paste(pathname, "pathways enriched in S. Aureus vs. RPMI at 4hrs"))
+
+time <- "24hr"
+LPS_24 <- fgseaFromdds(dds_24hr, test = "LPS", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                       name = paste(pathname, "pathways enriched in LPS vs. RPMI at 24hrs"))
+
+PolyIC_24 <- fgseaFromdds(dds_24hr, test = "PolyIC", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                          name = paste(pathname, "pathways enriched in PolyIC vs. RPMI  at 24hrs"))
+
+CAlb_24 <- fgseaFromdds(dds_24hr, test = "C_Albicans", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                        name = paste(pathname, "pathways enriched in C. Albicans vs. RPMI at 24hrs"))
+
+SAur_24 <- fgseaFromdds(dds_24hr, test = "S_Aureus", control = "RPMI", pathways = pathways, time, pathname, 
+                      min = 100,
+                      max = 500, 
+                        name = paste(pathname, "pathways enriched in S. Aureus vs. RPMI at 24hrs"))
+
+pathway_res_4 <- list(CAlb_4, LPS_4, PolyIC_4, SAur_4) %>% map2(names(.), ~mutate(.x, condition = .y))
+pathway_res_24 <- list(CAlb_24, LPS_24, PolyIC_24, SAur_24) %>% map2(names(.), ~mutate(.x, condition = .y))
+```
+
+Number of induced pathways (Figure S12A)
+```{r}
+pathways_res <- rbind(do.call(rbind, pathway_res_4) %>% mutate(time = "4hr"),
+                      do.call(rbind, pathway_res_24) %>% mutate(time = "24hr"))
+
+pathways_res_padj <- pathways_res %>% subset(padj < 0.01) %>% mutate(dir = ifelse(NES >= 0, "up", "down")) %>%
+  mutate(condition = ifelse(condition == "C_Albicans", glue("<i>C. albicans<i>"), 
+                       ifelse(condition == "S_Aureus", glue("<i>S. aureus<i>"), 
+                              ifelse(condition == "PolyIC", "Poly(I:C)",
+                                     ifelse(condition == "LPS", "LPS", condition)))))
+
+pathways_res$condition <- factor(pathways_res$condition, levels = c("LPS", "<i>C. albicans<i>", "Poly(I:C)", "<i>S. aureus<i>"))
+
+pathways_res_padj$time <- factor(pathways_res_padj$time, levels = c("4hr", "24hr"))
+pathways_res_padj$dir <- factor(pathways_res_padj$dir, levels = c("up", "down"))
+pathways_res_padj_plot <- pathways_res_padj %>% 
+  dplyr::count(condition, time, dir) %>% 
+  tidyr::complete(condition, time, dir, fill = list(n = 0)) %>% 
+  ggplot(aes(x = time, y = n, fill = condition, label = n)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(y = n+14), size = 3, position = position_dodge(width = .9)) +
+  facet_grid(~dir) +
+  scale_fill_viridis_d(begin = 0.2, end = 1) +
+  labs(x = "Time point", y = "GO:Biological Process (N)", fill = "Stimulus") +
+  theme_classic() +
+  theme(text = element_text(size = 16), legend.text = ggtext::element_markdown())
+```
+
+Examples up/down for LPS (Figure S12B-E)
+```{r}
+pathname <- "GOBP_NCRNA_METABOLIC_PROCESS"
+pathname <- "GOBP_RIBONUCLEOPROTEIN_COMPLEX_BIOGENESIS"
+pathname <- "GOBP_RRNA_METABOLIC_PROCESS"
+pathname <- "GOBP_RIBOSOME_BIOGENESIS"
+
+ggarrange(
+  getDataForGSEAPlot(dds_4hr, test = "LPS", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "4hr"),
+  getDataForGSEAPlot(dds_4hr, test = "C_Albicans", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "4hr"),
+  getDataForGSEAPlot(dds_4hr, test = "S_Aureus", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "4hr"),
+  getDataForGSEAPlot(dds_4hr, test = "PolyIC", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "4hr"),
+  
+  getDataForGSEAPlot(dds_24hr, test = "LPS", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "24hr"),
+  getDataForGSEAPlot(dds_24hr, test = "C_Albicans", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "24hr"),
+  getDataForGSEAPlot(dds_24hr, test = "S_Aureus", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "24hr"),
+  getDataForGSEAPlot(dds_24hr, test = "PolyIC", control = "RPMI", pathways = pathways, pathwayname = pathname, time = "24hr"),
+    ncol = 4, nrow = 2,
+  labels = c("LPS_4hr", "CAlb_4hr", "SAur_4hr", "PolyIC_4hr", "LPS_24hr", "CAlb_24hr", "SAur_24hr", "PolyIC_24hr")
+)
+```
+
+Overlapping pathway sets (Figure 2A-B)
+```{r}
+names(pathway_res_4) <- c("C_Albicans", "LPS", "PolyIC", "S_Aureus")
+names(pathway_res_24) <- c("C_Albicans", "LPS", "PolyIC", "S_Aureus")
+
+getPaths <- function(t) {
+  out <- subset(t, padj < 0.01)
+  return(out)
+}
+
+getUp <- function(t) {
+  out <- subset(t, NES > 0)$pathway
+  return(out)
+}
+
+getDown <- function(t) {
+  out <- subset(t, NES < 0)$pathway
+  return(out)
+}
+
+names(pathway_res_4) <- pathway_res[grep("_4hr", pathway_res)]
+venn::venn(list(getUp(getPaths(pathway_res_4$LPS)),
+                getUp(getPaths(pathway_res_4$C_Albicans)),
+                getUp(getPaths(pathway_res_4$PolyIC)),
+                getUp(getPaths(pathway_res_4$S_Aureus))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+           ilabel = "counts",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+
+venn::venn(list(getDown(getPaths(pathway_res_4$LPS)),
+                getDown(getPaths(pathway_res_4$C_Albicans)),
+                getDown(getPaths(pathway_res_4$PolyIC)),
+                getDown(getPaths(pathway_res_4$S_Aureus))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           ilabel = "counts",
+           snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+
+
+names(pathway_res_24) <- pathway_res[grep("_24hr", pathway_res)]
+venn::venn(list(getUp(getPaths(pathway_res_24$LPS)),
+                getUp(getPaths(pathway_res_24$C_Albicans)),
+                getUp(getPaths(pathway_res_24$PolyIC)),
+                getUp(getPaths(pathway_res_24$S_Aureus))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           ilabel = "counts",
+           snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+
+venn::venn(list(getDown(getPaths(pathway_res_24$LPS)),
+                getDown(getPaths(pathway_res_24$C_Albicans)),
+                getDown(getPaths(pathway_res_24$PolyIC)),
+                getDown(getPaths(pathway_res_24$S_Aureus))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           ilabel = "counts",
+           snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+```
+
+Jaccard distances between enriched gene sets (Figure 2C)
+```{r}
+pathway_res_4_padj <- lapply(pathway_res_4, function(x) subset(x, padj < 0.01))
+pathway_res_24_padj <- lapply(pathway_res_24, function(x) subset(x, padj < 0.01))
+
+path_time_list <- list(
+  subset(pathway_res_4_padj$C_Albicans, NES > 0)$pathway,
+  subset(pathway_res_24_padj$C_Albicans, NES > 0)$pathway,
+  subset(pathway_res_4_padj$C_Albicans, NES < 0)$pathway,
+  subset(pathway_res_24_padj$C_Albicans, NES < 0)$pathway,
+  subset(pathway_res_4_padj$LPS, NES > 0)$pathway,
+  subset(pathway_res_24_padj$LPS, NES > 0)$pathway,
+  subset(pathway_res_4_padj$LPS, NES < 0)$pathway,
+  subset(pathway_res_24_padj$LPS, NES < 0)$pathway,
+  subset(pathway_res_4_padj$S_Aureus, NES > 0)$pathway,
+  subset(pathway_res_24_padj$S_Aureus, NES > 0)$pathway,
+  subset(pathway_res_4_padj$S_Aureus, NES < 0)$pathway,
+  subset(pathway_res_24_padj$S_Aureus, NES < 0)$pathway,
+  subset(pathway_res_4_padj$PolyIC, NES > 0)$pathway,
+  subset(pathway_res_24_padj$PolyIC, NES > 0)$pathway,
+  subset(pathway_res_4_padj$PolyIC, NES < 0)$pathway,
+  subset(pathway_res_24_padj$PolyIC, NES < 0)$pathway
+)
+
+names(path_time_list) <- c("CAlb_4_up", "CAlb_24_up", "CAlb_4_down", "CAlb_24_down",
+                           "LPS_4_up", "LPS_24_up", "LPS_4_down", "LPS_24_down",
+                           "SAur_4_up", "SAur_24_up", "SAur_4_down", "SAur_24_down",
+                           "PolIC_4_up", "PolIC_24_up", "PolIC_4_down", "PolIC_24_down")
+jaccard_path <- matrix(ncol = length(path_time_list), nrow = length(path_time_list))
+       
+for (i in 1:nrow(jaccard_path)) {
+  for (j in 1:ncol(jaccard_path)) {
+    jaccard_path[i,j] <- jaccard(path_time_list[[i]], path_time_list[[j]])
+  }
+}
+
+rownames(jaccard_path) <- names(path_time_list)
+colnames(jaccard_path) <- names(path_time_list)
+
+t <- jaccard_path %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column("sample_1") %>% 
+  melt(id.vars = "sample_1", measure.vars = names(path_time_list)) 
+
+custom_order <- c("CAlb_4_up", "LPS_4_up", "SAur_4_up", "PolIC_4_up", 
+                  "CAlb_24_up", "LPS_24_up", "SAur_24_up", "PolIC_24_up",
+                  "CAlb_4_down", "LPS_4_down", "SAur_4_down", "PolIC_4_down", 
+                  "CAlb_24_down", "LPS_24_down", "SAur_24_down", "PolIC_24_down")
+t$sample_1 <- factor(t$sample_1, levels = custom_order)
+t$variable <- factor(t$variable, levels = custom_order)
+t %>% 
+  ggplot(aes(x = sample_1, y = variable, fill = value, label = round(value, 2))) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_distiller(direction = -1) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+Overlap between time points: each stimulus separate (Figure 2D)
+```{r}
+venn::venn(list(getUp(getPaths(pathway_res_4$LPS)), getUp(getPaths(pathway_res_24$LPS))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getUp(getPaths(pathway_res_4$C_Albicans)), getUp(getPaths(pathway_res_24$C_Albicans))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getUp(getPaths(pathway_res_4$PolyIC)), getUp(getPaths(pathway_res_24$PolyIC))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getUp(getPaths(pathway_res_4$S_Aureus)), getUp(getPaths(pathway_res_24$S_Aureus))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getDown(getPaths(pathway_res_4$LPS)), getDown(getPaths(pathway_res_24$LPS))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getDown(getPaths(pathway_res_4$C_Albicans)), getDown(getPaths(pathway_res_24$C_Albicans))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getDown(getPaths(pathway_res_4$PolyIC)), getDown(getPaths(pathway_res_24$PolyIC))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+
+venn::venn(list(getDown(getPaths(pathway_res_4$S_Aureus)), getDown(getPaths(pathway_res_24$S_Aureus))
+  ), ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "4 hours, 24 hours", box = F, zcolor = as.vector(viridis::viridis_pal()(2)[1:2]), ilabels = "counts"
+)
+```
+
+Example pathways (Figure 2E)
+```{r}
+updown_LPS <- intersect(subset(pathway_res_4_padj$LPS, NES > 0)$pathway,
+          subset(pathway_res_24_padj$LPS, NES < 0)$pathway)
+
+updown_LPS_val <- rbind(
+  pathway_res_4$LPS %>% mutate(time = "4hr"),
+  pathway_res_24$LPS %>% mutate(time = "24hr")
+) %>% 
+  mutate(updown = ifelse(pathway %in% updown_LPS, T, F)) %>% 
+  mutate(signif = ifelse(padj < 0.01, T, F))
+
+updown_LPS_signif <- subset(updown_LPS_val, signif == T) %>% group_by(pathway) %>% summarize(n = n()) %>% subset(n > 1)
+updown_LPS_signif$pathway %>% unique()
+
+updown_LPS_val$time <- factor(updown_LPS_val$time, levels = c("4hr", "24hr"))
+dat <- updown_LPS_val %>% 
+  mutate(show = ifelse(pathway %in% updown_LPS_signif$pathway, T, F)) 
+
+ggplot(dat, aes(x = time, y = NES, group = pathway, alpha = updown)) +
+  geom_point(aes(color = interaction(show, updown))) +
+  geom_line(aes(color = interaction(show, updown))) +
+  geom_text(data = subset(dat, updown == T & signif == T & show == T), aes(label = pathway)) +
+  scale_color_viridis_d() +
+  facet_grid() +
+  theme_classic()
+```
+
+Core pathways (Figure 2F)
+```{r}
+core_up <- venn::venn(list(
+  Reduce(intersect, list(
+    getUp(getPaths(pathway_res_4$LPS)),
+    getUp(getPaths(pathway_res_4$C_Albicans)),
+    getUp(getPaths(pathway_res_4$PolyIC)),
+    getUp(getPaths(pathway_res_4$S_Aureus)))),
+  Reduce(intersect, list(
+    getUp(getPaths(pathway_res_24$LPS)),
+    getUp(getPaths(pathway_res_24$C_Albicans)),
+    getUp(getPaths(pathway_res_24$PolyIC)),
+    getUp(getPaths(pathway_res_24$S_Aureus))))
+  ), ilabels = "counts", ggplot = T, box = F, snames = "4 hours, 24 hours", zcolor = as.vector(viridis::viridis_pal()(2)[1:2]))
+
+core_down <- venn::venn(list(
+  Reduce(intersect, list(
+    getDown(getPaths(pathway_res_4$LPS)),
+    getDown(getPaths(pathway_res_4$C_Albicans)),
+    getDown(getPaths(pathway_res_4$PolyIC)),
+    getDown(getPaths(pathway_res_4$S_Aureus)))),
+  Reduce(intersect, list(
+    getDown(getPaths(pathway_res_24$LPS)),
+    getDown(getPaths(pathway_res_24$C_Albicans)),
+    getDown(getPaths(pathway_res_24$PolyIC)),
+    getDown(getPaths(pathway_res_24$S_Aureus))))
+  ), ilabels = "counts", ggplot = T, box = F, snames = "4 hours, 24 hours", zcolor = as.vector(viridis::viridis_pal()(2)[1:2]))
+```
+
+## Revigo (Figure S4 and S13)
+Loading data
+```{r}
+#Similarity matrix generated on http://revigo.irb.hr/
+revigo_table <- read_tsv(here::here("data/Revigo_BP_OnScreenTable.tsv"))
+
+revigo_matrix <- read.delim(here::here("data/Revigo_BP_SimilarityMatrix.tsv")) %>% tibble::column_to_rownames("X") 
+
+revigo_matrix %>% as.matrix() %>% heatmap()
+
+get_revi_selection <- revigo_table$TermID
+get_revi_selection <- stringr::str_replace(get_revi_selection, ":", ".")
+colnames(revigo_matrix)[colnames(revigo_matrix) %in% get_revi_selection]
+revigo_matrix_selected <- revigo_matrix[
+  colnames(revigo_matrix) %in% get_revi_selection,
+  colnames(revigo_matrix) %in% get_revi_selection] 
+
+t <- stringr::str_replace(colnames(revigo_matrix_selected), "[.]", ":") 
+colnames(revigo_matrix_selected) <- revigo_table[match(t, revigo_table$TermID),]$Name
+rownames(revigo_matrix_selected) <- revigo_table[match(t, revigo_table$TermID),]$Name
+```
+
+Revigo clusters (Figure S4)
+```{r}
+fviz_nbclust(revigo_matrix_selected, kmeans, method = "wss") 
+```
+
+Revigo heatmap (Figure S13)
+```{r}
+#5 clusters
+cluster_n <- 5
+
+heat <- pheatmap::pheatmap(revigo_matrix_selected, 
+                           cutree_rows = cluster_n, cutree_cols = cluster_n, 
+                           show_rownames = T, show_colnames = F, border_color = NA) 
+```
+
+Network diagram of revigo results (Figure 2G) produced in cytoscape, see: revigo_network.cys
+
+# Differential gene expression (Figure 3A-C, S5 and S14B-C)
+Volcano plots (Figure S5)
+```{r}
+Masterfile$`time-point` <- factor(Masterfile$`time-point`, levels = c("4hr", "24hr"))
+volcano <- Masterfile %>% 
+  subset(!is.na(padj)) %>% 
+  mutate(Significance = ifelse(padj < 0.01 & log2FoldChange >= 1,
+                               "DEGup",
+                               ifelse(padj < 0.01 & log2FoldChange <= 1,
+                                      "DEGdown",
+                                      "NS"))) 
+#Lowest Padj
+toppadj <- rbind(Masterfile %>% subset(padj < 0.01 & direction == "up") %>% group_by(`time-point`, condition, direction) %>% slice_min(order_by = padj, n = 10),
+                Masterfile %>% subset(padj < 0.01 & direction == "down") %>% group_by(`time-point`, condition, direction) %>% slice_min(order_by = padj, n = 10))
+ggplot(volcano) +
+  theme_bw() +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), color = factor(Significance)), size = 0.5) +
+  geom_text_repel(data = toppadj, aes(x = log2FoldChange, y = -log10(padj), label = geneName), max.overlaps = Inf, size = 5) +
+  scale_color_manual(
+    values = c(
+      NS = "black", 
+      DEGup = viridisLite::viridis(n = 2, begin = 0.1, end = 0.9)[2], 
+      DEGdown = viridisLite::viridis(n = 2, begin = 0.1, end = 0.9)[1]
+    ), 
+    labels = c(
+      NS = "NS", 
+      DEGup = paste("padj <= 0.01 & Log2FoldChange >= 1"), 
+      DEGdown = paste("padj <= 0.01 & Log2FoldChange <= -1"))
+  ) + 
+  xlab(bquote(~Log[2]~ "fold change")) +
+  facet_grid(condition~`time-point`) +
+  ylab(bquote(~-Log[10]~ "adjusted" ~italic(p)~"-value")) +
+  geom_vline(xintercept = c(-1, 1), 
+             linetype = "longdash", 
+             colour = "grey", 
+             size=0.4) +
+  geom_hline(yintercept = -log10(0.01), 
+             linetype = "longdash", 
+             colour = "grey", 
+             size=0.4) +
+  theme(legend.title = element_blank(),
+        text = element_text(size = 24),
+        legend.text = element_text(size = 24),
+        legend.position = "top") +
+  guides(colour = guide_legend(override.aes = list(size=1), ncol=1, nrow=4, byrow=TRUE)) 
+```
+
+PolyIC DEGs at 4hr (Figure S14B)
+```{r}
+polic_4hr_gprof <- gprofiler2::gost(getGenes(subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr")))$result
+
+plot <- polic_4hr_gprof %>% 
+  subset(term_size > 100 & term_size < 500) %>% 
+  subset(!source %in% c("TF", "MIRNA", "WP")) %>% 
+  slice_min(p_value, n=10) %>% 
+  ggplot(aes(x = -log10(p_value), y = reorder(term_name, -p_value), fill = source)) +
+  geom_col() +
+  #facet_grid(time~., scales = "free_y") +
+  xlab(expression('-log'[10]*"P")) +
+  labs(y = "Term name", fill = "Gene set source") +
+  theme_classic() +
+  theme(text = element_text(size = 14), legend.position = "right")
+```
+
+LPS DEGs at both time points (Figure S14C)
+```{r}
+LPS_compare <- rbind(
+  gprofiler2::gost(query = subset(LPS, direction == "down" & time == "4hr")$geneName, 
+                   organism = "hsapiens", ordered_query = FALSE, 
+                   multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                   measure_underrepresentation = FALSE, evcodes = FALSE, 
+                   user_threshold = 0.05, correction_method = "g_SCS", 
+                   domain_scope = "annotated", custom_bg = NULL, 
+                   numeric_ns = "", sources = NULL, as_short_link = FALSE)$result %>% 
+    mutate(time = "4hr") %>% mutate(dir = "down"),
+  
+  gprofiler2::gost(query = subset(LPS, direction == "down" & time == "24hr")$geneName, 
+                   organism = "hsapiens", ordered_query = FALSE, 
+                   multi_query = FALSE, significant = TRUE, exclude_iea = FALSE, 
+                   measure_underrepresentation = FALSE, evcodes = FALSE, 
+                   user_threshold = 0.05, correction_method = "g_SCS", 
+                   domain_scope = "annotated", custom_bg = NULL, 
+                   numeric_ns = "", sources = NULL, as_short_link = FALSE)$result %>% 
+    mutate(time = "24hr") %>% mutate(dir = "down")
+)
+
+plot <- LPS_compare %>% 
+  subset(term_size > 100 & term_size < 500) %>% 
+  mutate(time = factor(time, levels = c("4hr", "24hr"))) %>% 
+  ggplot(aes(x = -log10(p_value), y = reorder(term_name, -p_value), fill = source)) +
+  geom_col() +
+  facet_grid(time~., scales = "free_y") +
+  xlab(expression('-log'[10]*"P")) +
+  labs(y = "Term name", fill = "Gene set source") +
+  theme_classic() +
+  theme(text = element_text(size = 12), legend.position = "right")
+```
+
+Overlap (Figure 3A-B)
+```{r}
+degs_4hr_up <- list(
+  getGenes(subset(Masterfile_padj, condition == "LPS" & `time-point` == "4hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "CAlb" & `time-point` == "4hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "SAur" & `time-point` == "4hr" & log2FoldChange >= 0))
+  )
+
+overlap_4hr_up <- venn::venn(
+  degs_4hr_up,
+  ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "LPS, C. albicans, Poly(I:C), S. aureus", box = F, zcolor = as.vector(viridis::viridis_pal()(5)[2:5]), ilabels = "counts"
+)
+
+degs_4hr_down <- list(
+  getGenes(subset(Masterfile_padj, condition == "LPS" & `time-point` == "4hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "CAlb" & `time-point` == "4hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "SAur" & `time-point` == "4hr" & log2FoldChange <= 0))
+  )
+overlap_4hr_down <- venn::venn(
+  degs_4hr_down,
+  ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "LPS, C. albicans, Poly(I:C), S. aureus", box = F, zcolor = as.vector(viridis::viridis_pal()(5)[2:5]), ilabels = "counts"
+)
+
+degs_24hr_up <- list(
+  getGenes(subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & log2FoldChange >= 0)),
+  getGenes(subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & log2FoldChange >= 0))
+  )
+
+overlap_24hr_up <- venn::venn(
+  degs_24hr_up,
+  ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "LPS, C. albicans, Poly(I:C), S. aureus", box = F, zcolor = as.vector(viridis::viridis_pal()(5)[2:5]), ilabels = "counts"
+)
+
+
+degs_24hr_down <- list(
+  getGenes(subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & log2FoldChange <= 0)),
+  getGenes(subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & log2FoldChange <= 0))
+  )
+
+overlap_24hr_down <- venn::venn(
+  degs_24hr_down,
+  ggplot = T, ilcs = 1.5, sncs = 1.5, snames = "LPS, C. albicans, Poly(I:C), S. aureus", box = F, zcolor = as.vector(viridis::viridis_pal()(5)[2:5]), ilabels = "counts"
+)
+```
+
+Overlap at both time points (Figure 3C)
+```{r}
+LPS <- subset(Masterfile_padj, condition == "LPS")
+CAlb <- subset(Masterfile_padj, condition == "CAlb")
+PolIC <- subset(Masterfile_padj, condition == "PolIC")
+SAur <- subset(Masterfile_padj, condition == "SAur")
+
+#Up
+venn::venn(list(Reduce(intersect, list(subset(LPS, `time-point` == "4hr" & log2FoldChange > 0)$geneName, 
+                                       subset(SAur, `time-point` == "4hr" & log2FoldChange > 0)$geneName,
+                                       subset(PolIC, `time-point` == "4hr" & log2FoldChange > 0)$geneName,
+                                       subset(CAlb, `time-point` == "4hr" & log2FoldChange > 0)$geneName)),
+                Reduce(intersect, list(subset(LPS, `time-point` == "24hr" & log2FoldChange > 0)$geneName, 
+                                       subset(SAur, `time-point` == "24hr" & log2FoldChange > 0)$geneName,
+                                       subset(PolIC, `time-point` == "24hr" & log2FoldChange > 0)$geneName,
+                                       subset(CAlb, `time-point` == "24hr" & log2FoldChange > 0)$geneName))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           snames = "4 hours up, 24 hours up",
+           ilabels = "counts",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+
+#Down
+venn::venn(list(Reduce(intersect, list(subset(LPS, `time-point` == "4hr" & log2FoldChange < 0)$geneName, 
+                                       subset(SAur, `time-point` == "4hr" & log2FoldChange <  0)$geneName,
+                                       subset(PolIC, `time-point` == "4hr" & log2FoldChange < 0)$geneName,
+                                       subset(CAlb, `time-point` == "4hr" & log2FoldChange < 0)$geneName)),
+                Reduce(intersect, list(subset(LPS, `time-point` == "24hr" & log2FoldChange < 0)$geneName, 
+                                       subset(SAur, `time-point` == "24hr" & log2FoldChange < 0)$geneName,
+                                       subset(PolIC, `time-point` == "24hr" & log2FoldChange < 0)$geneName,
+                                       subset(CAlb, `time-point` == "24hr" & log2FoldChange < 0)$geneName))),
+           ggplot = T,
+           ilcs = 1.5,
+           sncs = 1.5,
+           ilabels = "counts",
+           snames = "4 hours down, 24 hours down",
+           box = F,
+           zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+```
+
+## TLR signaling pathway (Figure S14D-F)
+Gathering data. Analysis performed in cytoscape, see: tlr_plot.cys (Figure S14D-E)
+```{r}
+tlr_lfc_4hr <- unique(tlr_genes)
+tlr_lfc_4hr <- left_join(tlr_lfc_4hr, Masterfile %>% subset(condition == "LPS" & time == "4hr") %>% 
+                   dplyr::select(geneName, lfc_lps_4hr = log2FoldChange), by = "geneName")
+tlr_lfc_4hr <- left_join(tlr_lfc_4hr, Masterfile %>% subset(condition == "CAlb" & time == "4hr") %>%
+                   dplyr::select(geneName, lfc_calb_4hr = log2FoldChange), by = "geneName")
+tlr_lfc_4hr <- left_join(tlr_lfc_4hr, Masterfile %>% subset(condition == "PolIC"  & time == "4hr") %>% 
+                   dplyr::select(geneName, lfc_polic_4hr = log2FoldChange), by = "geneName")
+tlr_lfc_4hr <- left_join(tlr_lfc_4hr, Masterfile %>% subset(condition == "SAur"  & time == "4hr") %>% 
+                   dplyr::select(geneName, lfc_saur_4hr = log2FoldChange), by = "geneName")
+tlr_lfc_4hr <- tlr_lfc_4hr %>% dplyr::select(-geneName)
+
+tlr_lfc_24hr <- unique(tlr_genes)
+tlr_lfc_24hr <- left_join(tlr_lfc_24hr, Masterfile %>% subset(condition == "LPS" & time == "24hr") %>% 
+                            dplyr::select(geneName, lfc_lps_24hr = log2FoldChange), by = "geneName")
+tlr_lfc_24hr <- left_join(tlr_lfc_24hr, Masterfile %>% subset(condition == "CAlb" & time == "24hr") %>%
+                            dplyr::select(geneName, lfc_calb_24hr = log2FoldChange), by = "geneName")
+tlr_lfc_24hr <- left_join(tlr_lfc_24hr, Masterfile %>% subset(condition == "PolIC"  & time == "24hr") %>% 
+                            dplyr::select(geneName, lfc_polic_24hr = log2FoldChange), by = "geneName")
+tlr_lfc_24hr <- left_join(tlr_lfc_24hr, Masterfile %>% subset(condition == "SAur"  & time == "24hr") %>% 
+                            dplyr::select(geneName, lfc_saur_24hr = log2FoldChange), by = "geneName")
+tlr_lfc_24hr <- tlr_lfc_24hr %>% dplyr::select(-geneName)
+```
+
+LFC distribution at 4 vs. 24hr (Figure S14F)
+```{r}
+padj_dist_tlr <- tlr_dat %>% reshape2::melt(id.vars = c("column"), measure.vars = c(
+                                                                   "padj_lps_4hr", "padj_calb_4hr", "padj_polic_4hr", "padj_saur_4hr",
+                                                                   "padj_lps_24hr", "padj_calb_24hr", "padj_polic_24hr", "padj_saur_24hr")) %>% 
+  mutate(id = paste0(column, "_", str_split(variable, "_") %>% purrr::map_chr(.,2), "_", str_split(variable, "_") %>% purrr::map_chr(.,3))) %>% 
+  dplyr::select(-variable)
+
+lfc_dist_tlr <- tlr_dat %>% reshape2::melt(id.vars = c("column"), measure.vars = c("lfc_lps_4hr", "lfc_calb_4hr", "lfc_polic_4hr", "lfc_saur_4hr",
+                                                                   "lfc_lps_24hr", "lfc_calb_24hr", "lfc_polic_24hr", "lfc_saur_24hr")) %>% mutate(cond = str_split(variable, "_") %>% purrr::map_chr(.,2)) %>% 
+  mutate(time = str_split(variable, "_") %>% purrr::map_chr(.,3)) %>% 
+  mutate(id = paste0(column, "_", str_split(variable, "_") %>% purrr::map_chr(.,2), "_", str_split(variable, "_") %>% purrr::map_chr(.,3))) %>% 
+  dplyr::select(-variable)
+
+t <- left_join(lfc_dist_tlr, padj_dist_tlr, by = "id") %>% dplyr::select(-column.y)
+colnames(t) <- c("gene", "lfc", "cond", "time", "id", "padj")
+
+lfc_dist_tlr <- t %>% mutate(signif = ifelse(padj < 0.01, T, F))
+
+
+lfc_dist_tlr <- lfc_dist_tlr %>%  
+  mutate(time = str_split(id, "_") %>% purrr::map_chr(.,3)) %>% 
+  mutate(cond = ifelse(cond == "calb", glue("<i>C. albicans<i>"), 
+                       ifelse(cond == "saur", glue("<i>S. aureus<i>"), 
+                              ifelse(cond == "polic", "Poly(I:C)",
+                                     ifelse(cond == "lps", "LPS", cond)))))
+
+lfc_dist_tlr$cond <- factor(lfc_dist_tlr$cond, levels = c("LPS", "<i>C. albicans<i>", "Poly(I:C)", "<i>S. aureus<i>"))
+lfc_dist_tlr$time <- factor(lfc_dist_tlr$time, levels = c("4hr", "24hr"))
+lfc_dist_tlr_plot <- lfc_dist_tlr %>% 
+  subset(!is.na(lfc)) %>% 
+  subset(signif != F) %>% 
+  mutate(lfc_cut = cut(lfc, breaks = c(-Inf, 0, 1, 2, 5, Inf))) %>% 
+  group_by(cond, time, signif) %>% 
+  dplyr::count(lfc_cut) %>% 
+  ungroup() %>% 
+  tidyr::complete(lfc_cut, cond, time, signif, fill = list(n = 0)) %>% 
+  ggplot(aes(x = lfc_cut, y = n, fill = time)) +
+  geom_col(position = "dodge") +
+  facet_grid(~cond) +
+  labs(x = "LogFoldChange", y = "TLR-associated DEGs (N)") +
+  theme_classic() +
+  theme(strip.text.x = ggtext::element_markdown(), legend.position = "none", text = element_text(size = 14))
+```
+
+# Gene expression validations using external datasets (Figure S15A-H)
+## Harrison et al. (Figure S15A-B)
+PCA (Figure S15A)
+```{r}
+#The harrison 2019 dataset is available at PMID: 31358949
+files <- list.files(here::here("data/GSE120502_RAW"), pattern = ".txt")
+matrix <- matrix(ncol = length(files), nrow = length(read.delim(paste0(here::here("data/GSE120502_RAW/"), files[1]))[,2]))
+
+for (i in 1:length(files)) {
+  matrix[, i] <- read.delim(paste0(here::here("data/GSE120502_RAW/"), files[i]))[,2]
+}
+colnames(matrix) <- files
+rownames(matrix) <- read.delim(paste0(here::here("data/GSE120502_RAW/"), files[1]))[,1]
+
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+filters <- listFilters(ensembl)
+attributes <- listAttributes(ensembl)
+
+genenames_harrison <- rownames(matrix)
+geneids_harrison <- 
+  biomaRt::getBM(attributes = c('hgnc_symbol', 'ensembl_gene_id', 'external_gene_name', 'external_synonym'),
+                 filters = c('external_gene_name'),
+                 values = genenames_harrison, 
+                 mart = ensembl)
+
+length(geneids_harrison$ensembl_gene_id) == length(rownames(matrix))
+
+harrison_raw <- as.data.frame(matrix)
+harrison_raw$geneName <- rownames(matrix)
+
+for (i in 1:length(harrison_raw$geneName)) {
+  print(i)
+  
+  genename <- geneids_harrison$ensembl_gene_id[geneids_harrison$external_gene_name == harrison_raw$geneName[i]] 
+  harrison_raw$Transcript[i] <- ifelse(identical(genename, character(0)),
+                                                 NA,
+                                                 genename)
+}
+#For some reason, some gene names were already ensembl IDs ... these are added back in now
+
+for (i in 1:length(harrison_raw$Transcript)) {
+  if (is.na(harrison_raw$Transcript[i]) & substr(harrison_raw$geneName[i], 1, 4) == "ENSG") {
+    harrison_raw$Transcript[i] <- harrison_raw$geneName[i]
+  }
+}
+
+#Now, there are still some genes missing:
+nrow(subset(harrison_raw, is.na(Transcript)))
+
+#Using biomart again to gather these using the aliases
+missing <- subset(harrison_raw, is.na(Transcript))$geneName
+missing_harrison <- 
+  biomaRt::getBM(attributes = c('hgnc_symbol', 'ensembl_gene_id', 'external_gene_name', 'external_synonym'),
+                 filters = c('external_synonym'),
+                 values = missing, 
+                 mart = ensembl)
+
+for (i in 1:length(harrison_raw$geneName)) {
+
+  if (is.na(harrison_raw$Transcript[i])) {
+    genename <- missing_harrison$ensembl_gene_id[missing_harrison$external_synonym == harrison_raw$geneName[i]] 
+    
+    harrison_raw$Transcript[i] <- ifelse(identical(genename, character(0)),
+                                         NA,
+                                         genename)
+  }
+}
+
+#Now, there are still some genes missing:
+nrow(subset(harrison_raw, is.na(Transcript)))
+
+subset(harrison_raw, is.na(Transcript))
+
+#For now, I'm removing these genes, maybe later we can check whether these can be added back in using either biomart or manual editing.
+harrison_raw <- subset(harrison_raw, !is.na(Transcript))
+n_occur <- data.frame(table(harrison_raw$Transcript))
+
+#Removing double genes, choosing the one with the highest total reads
+sumcol <- ncol(harrison_raw) -2
+for (i in 1:nrow(harrison_raw)) {
+  if (harrison_raw$Transcript[i] %in% n_occur[n_occur$Freq > 1,]$Var1) {
+    harrison_raw$rowsum[i] <- sum(harrison_raw[i, 1:sumcol])
+  } else {
+    harrison_raw$rowsum[i] <- NA
+  }
+}
+non_unique <- subset(harrison_raw, Transcript %in% n_occur[n_occur$Freq > 1,]$Var1)
+non_unique <- split(non_unique, non_unique$Transcript)
+
+
+getHighestExpressed <- function(t) {
+  out <- t[which.max(t$rowsum),]
+  return(out)
+}
+non_unique <- do.call(rbind, lapply(non_unique, getHighestExpressed))
+
+unique <- subset(harrison_raw, Transcript %ni% n_occur[n_occur$Freq > 1,]$Var1)
+
+#Putting back together
+harrison_raw <- rbind(non_unique, unique)
+
+rownames(harrison_raw) <- harrison_raw$Transcript
+harrison_raw <- harrison_raw %>% dplyr::select(-geneName, -Transcript, -rowsum)
+harrison_raw <- as.matrix(harrison_raw)
+class(harrison_raw) <- "numeric"
+harrison_raw <- as.data.frame(harrison_raw)
+
+harrison_metadat <- matrix(ncol = 4, nrow = ncol(harrison_raw))
+harrison_metadat[, 1] <- colnames(harrison_raw)
+for (i in 1:ncol(harrison_raw)) {
+  harrison_metadat[i, 2] <- str_split(colnames(harrison_raw)[i], "_")[[1]][2]
+  harrison_metadat[i, 3] <- str_split(colnames(harrison_raw)[i], "_")[[1]][3]
+  harrison_metadat[i, 4] <- ifelse(str_split(colnames(harrison_raw)[i], "_")[[1]][4] == "BATCH",
+                                   paste0(str_split(colnames(harrison_raw)[i], "_")[[1]][4], "_", str_split(colnames(harrison_raw)[i], "_")[[1]][5]),
+                                   str_split(colnames(harrison_raw)[i], "_")[[1]][4])
+}
+colnames(harrison_metadat) <- c("id", "donor", "stimulus", "batch")
+
+dds_harrison_4hr <- DESeqDataSetFromMatrix(
+  countData = harrison_raw, 
+  colData = harrison_metadat, 
+  design = ~ donor + stimulus
+  ) %>% 
+  mRNA_function %>% 
+  keepFromddsHTSeq 
+nrow(dds_harrison_4hr)
+
+
+dds_harrison_4hr$group <- relevel(dds_harrison_4hr$group, ref = "CTL")
+
+main <- counts(dds_4hr)
+main <- cbind(rownames(main), main)
+colnames(main)[1] <- "gene"
+
+colnames(main)
+
+harrison <- counts(dds_harrison_4hr)
+harrison <- cbind(rownames(harrison), harrison)
+colnames(harrison)[1] <- "gene"
+
+harrison_master <- full_join(as.data.frame(main), as.data.frame(harrison), by = "gene")
+rownames(harrison_master) <- harrison_master$gene
+main <- main[, -1]
+harrison_master$gene <- NULL
+
+metadata_both <- as.data.frame(harrison_metadat)
+for (i in 1:nrow(metadata_both)) {
+  if(metadata_both$stimulus[i] == "CTL") {metadata_both$stimulus[i] <- "RPMI"}
+  
+  metadata_both$donor[i] <- paste0("Harrison_", metadata_both$donor[i])
+  metadata_both$time[i] <- "4hr"
+}
+
+metadata_main <- matrix(nrow = ncol(main), ncol = 5)
+for (i in 1:ncol(main)) {
+  metadata_main[i, 1] <- colnames(main)[i]
+  metadata_main[i, 2] <- str_split(metadata_main[i, 1], "_")[[1]][2]
+  metadata_main[i, 3] <- substr(str_split(metadata_main[i, 1], "_")[[1]][1], 1, 1)
+  metadata_main[i, 4] <- ifelse(str_split(metadata_main[i, 1], "_")[[1]][3] != "repl",
+                                str_split(metadata_main[i, 1], "_")[[1]][3],
+                                str_split(metadata_main[i, 1], "_")[[1]][4])
+  metadata_main[i, 5] <- 1
+}
+colnames(metadata_main) <- c("id", "stimulus", "donor", "time", "batch")
+metadata_main <- as.data.frame(metadata_main)
+metadata_main <- subset(metadata_main, time == "4hr")
+
+metadata_both <- rbind(metadata_main, metadata_both)
+rownames(metadata_both) <- metadata_both$id
+
+
+harrison_master <- drop_na(harrison_master)
+harrison_master <- as.matrix(harrison_master)
+class(harrison_master) <- "numeric"
+harrison_master <- as.data.frame(harrison_master)
+
+harrison_master <- 
+  DESeqDataSetFromMatrix(
+  countData = harrison_master, 
+  colData = metadata_both, 
+  design = ~ donor
+  ) 
+
+keep <- rowSums(counts(harrison_master)) >= 10
+harrison_master <- harrison_master[keep, ]
+harrison_master <- harrison_master %>% 
+  mRNA_function
+
+harrison_master$stimulus <- as.factor(harrison_master$stimulus)
+harrison_master$stimulus <- relevel(harrison_master$stimulus, ref = "RPMI")
+
+ntd_both <- normTransform(harrison_master)
+
+colData(ntd_both) <- cbind(colData(ntd_both), study=c(rep("QuantSeq", 27), rep("Harrison_2019", 250)))
+assay(ntd_both) <- limma::removeBatchEffect(assay(ntd_both), ntd_both$study)
+pcaData <- plotPCA(ntd_both, 
+                   intgroup=c("stimulus", "group"), 
+                   returnData=TRUE
+                   )
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+for (i in 1:nrow(pcaData)) {
+  pcaData$harrison_group[i] <- ifelse(is.na(substr(str_split(pcaData$group.1[i], "_")[[1]][2], 1, 1)),
+                                      "QuantSeq",
+                                      substr(str_split(pcaData$group.1[i], "_")[[1]][2], 1, 1))
+}
+  pcaData %>%
+    mutate(donor_dataset = ifelse(group.1 %in% c("A", "B", "C", "D", "E"), "QuantSeq", "Harrison_2019")) %>% 
+    ggplot(aes(x = PC1, y = PC2, shape = donor_dataset, color = stimulus)) +
+    geom_point(size = 4) +
+    scale_color_viridis_d() +
+    ggtitle("Comparing Harrison 2019 and QuantSeq") + 
+    scale_shape_discrete()+
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    theme(text = element_text(size = 24),
+          aspect.ratio=1)
+```
+
+DE correlations
+```{r}
+t_1 <- "4hr"
+t <- full_join(
+  Masterfile_Harrison_2019 %>% subset(condition == "LPS") %>% subset(time == t_1),
+  Masterfile %>% subset(condition == "LPS") %>% subset(time == t_1),
+  by = "Transcript"
+) %>% subset(!is.na(log2FoldChange.x)) %>% subset(!is.na(log2FoldChange.y)) %>% subset(!is.na(padj.x)) %>% subset(!is.na(padj.y))
+t %>% 
+  subset(padj.x < 0.01 & padj.y < 0.01) %>% 
+  ggplot(aes(x = log2FoldChange.x, y = log2FoldChange.y)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+s <- subset(t, padj.x < 0.01 & padj.y < 0.01)
+lm(s$log2FoldChange.x ~ s$log2FoldChange.y)
+```
+
+Overlap (Figure S15B)
+```{r}
+venn::venn(list(Masterfile_Harrison_2019$Transcript, subset(Masterfile, condition == "LPS")$Transcript), ilabels = "counts")
+
+deg_overlap_harrison.pdf
+
+harrison_lps_4hr <- subset(Masterfile_Harrison_2019, condition == "LPS")
+quant_4hr_lps <- subset(Masterfile, condition == "LPS" & time == "4hr")
+
+background <- intersect(Masterfile_Harrison_2019$Transcript, subset(Masterfile, condition == "LPS")$Transcript)
+de_both <- Reduce(intersect, list(subset(harrison_lps_4hr, padj < 0.01)$Transcript, subset(quant_4hr_lps, padj < 0.01)$Transcript))
+de_none <- background[!background %in% c(subset(harrison_lps_4hr, padj < 0.01)$Transcript, subset(quant_4hr_lps, padj < 0.01)$Transcript)]
+de_only_quant <- subset(quant_4hr_lps, padj < 0.01)$Transcript[!subset(quant_4hr_lps, padj < 0.01)$Transcript %in% subset(harrison_lps_4hr, padj < 0.01)$Transcript]
+de_only_har <- subset(harrison_lps_4hr, padj < 0.01)$Transcript[!subset(harrison_lps_4hr, padj < 0.01)$Transcript %in% subset(quant_4hr_lps, padj < 0.01)$Transcript]
+test <- data.frame(
+  c(length(de_both), length(de_only_har)),
+  c(length(de_only_quant), length(de_none))
+) %>% fisher.test()
+```
+
+## Corlet et al. (Figure S15C-D)
+PCA (Figure S15C)
+```{r}
+#The corley 2019 data is available from PMID: 31827207
+corley_2019 <- read.delim(here::here("validations/data/corley_2019.txt"), sep = "\t")
+
+#Generating a metadata file
+corley_2019_metadat <- matrix(ncol = 2, nrow = ncol(corley_2019)-1)
+corley_2019_metadat[,1] <- colnames(corley_2019)[2:ncol(corley_2019)]
+corley_2019_metadat[,2] <- c("control", "PolyIC", "control", "PolyIC", "control", "PolyIC")
+
+colnames(corley_2019_metadat) <- c("id", "stimulus")
+
+#Making a nice counts matrix
+rownames(corley_2019) <- corley_2019[,1]
+corley_2019 <- corley_2019 %>% dplyr::select(-X)
+
+dds_corley_2019 <- DESeqDataSetFromMatrix(
+  countData = corley_2019, 
+  colData = corley_2019_metadat, 
+  design = ~ stimulus
+  ) %>% 
+  keepFromddsHTSeq %>% 
+  mRNA_function
+
+dds_corley_2019$group <- relevel(dds_corley_2019$group, ref = "control")
+dds_corley_2019 <- DESeq(dds_corley_2019)
+
+resultsNames(dds_corley_2019) # lists the coefficients
+
+res_corley <- results(dds_corley_2019)
+
+# or to shrink log fold changes association with condition:
+
+res_corley <- lfcShrink(dds_corley_2019, coef = "group_PolyIC_vs_control", type = "apeglm")
+
+res_corley <- res_corley %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "PolIC") %>% tibble::rownames_to_column("Transcript")
+
+Masterfile_corley_2019 <- res_corley %>% 
+  addUpDown
+
+for (i in 1:nrow(Masterfile_corley_2019)) {
+  Masterfile_corley_2019$geneName[i] <- subset(ref_annot, Gene_id == Masterfile_corley_2019$Transcript[i])$Gene_name
+}
+
+main <- counts(ddsHTSeq_24hrs)
+main <- cbind(rownames(main), main)
+colnames(main)[1] <- "gene"
+
+colnames(main)
+keep <- c(1)
+for (i in 1:ncol(main)) {
+  if (str_split(colnames(main)[i], "_")[[1]][2] %in% c("RPMI", "PolyIC")) {
+    keep <- c(keep, i)
+  }
+}
+main <- main[, keep]
+
+corley <- counts(dds_corley_2019)
+corley <- cbind(rownames(corley), corley)
+colnames(corley)[1] <- "gene"
+
+corley_master <- full_join(as.data.frame(main), as.data.frame(corley), by = "gene")
+rownames(corley_master) <- corley_master$gene
+main <- main[, -1]
+corley_master$gene <- NULL
+
+metadata_both <- corley_2019_metadat
+metadata_both <- as.data.frame(metadata_both) %>% mutate(donor = 1)
+
+metadata_main <- matrix(nrow = ncol(main), ncol = 3)
+for (i in 1:ncol(main)) {
+  metadata_main[i, 1] <- colnames(main)[i]
+  metadata_main[i, 2] <- str_split(metadata_main[i, 1], "_")[[1]][2]
+  metadata_main[i, 3] <- substr(str_split(metadata_main[i, 1], "_")[[1]][1], 1, 1)
+}
+colnames(metadata_main) <- c("id", "stimulus", "donor")
+metadata_main <- as.data.frame(metadata_main)
+for (i in 1:nrow(metadata_main)) {
+  if (metadata_main$stimulus[i] == "RPMI") {
+    metadata_main$stimulus[i] <- "control"
+  }
+}
+
+metadata_both <- rbind(metadata_main, metadata_both) %>% subset(stimulus %in% c("control", "PolyIC"))
+
+corley_master <- drop_na(corley_master)
+corley_master <- as.matrix(corley_master)
+class(corley_master) <- "numeric"
+corley_master <- as.data.frame(corley_master)
+
+corley_master <- 
+  DESeqDataSetFromMatrix(
+  countData = corley_master, 
+  colData = metadata_both, 
+  design = ~ stimulus + donor
+  ) 
+
+keep <- rowSums(counts(corley_master)) >= 10
+corley_master <- corley_master[keep, ]
+corley_master <- corley_master %>% 
+  mRNA_function
+
+corley_master$stimulus <- relevel(corley_master$stimulus, ref = "control")
+
+ntd_both <- normTransform(corley_master)
+
+main <- counts(ddsHTSeq_24hrs)
+
+colData(ntd_both) <- cbind(colData(ntd_both), study=c(rep("QuantSeq", 25), rep("Corley_2019", 6)))
+assay(ntd_both) <- limma::removeBatchEffect(assay(ntd_both), ntd_both$study)
+pcaData <- plotPCA(ntd_both, 
+                   intgroup=c("stimulus", "group"), 
+                   returnData=TRUE
+                   )
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaData$donor <- pcaData$group.1
+for (i in 1:nrow(pcaData)) {
+  pcaData$time[i] <- ifelse(pcaData$name[i] %in% colnames(main), 
+                                             ifelse(str_split(pcaData$name[i], "_")[[1]][3] %in% c("4hr", "24hr"),
+                                                    str_split(pcaData$name[i], "_")[[1]][3],
+                                                    str_split(pcaData$name[i], "_")[[1]][4]),
+                                             pcaData$name[i])
+  
+  if(pcaData$time[i] %in% c("4hr", "4hrs")) {pcaData$time[i] <- "4hrs"} 
+  if(pcaData$time[i] %in% c("24hr", "24hrs")) {pcaData$time[i] <- "24hrs"} 
+}
+
+  pcaData %>%
+    mutate(donor_dataset = ifelse(group.1 %in% c("A", "B", "C", "D", "E"), "QuantSeq", "Corley_2019")) %>% 
+    ggplot(aes(x = PC1, y = PC2, shape = donor_dataset, color = stimulus)) +
+    geom_point(size = 4) +
+    scale_color_viridis_d() +
+    ggtitle("Comparing Corley 2019 and QuantSeq") + 
+    scale_shape_discrete()+
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    theme(text = element_text(size = 24),
+          aspect.ratio=1)
+```
+
+DE correlations
+```{r}
+t_1 <- "24hr"
+t <- full_join(
+  Masterfile_corley_2019 %>% subset(time == t_1),
+  Masterfile %>% subset(condition == "PolIC") %>% subset(time == t_1),
+  by = "Transcript"
+) %>% subset(!is.na(log2FoldChange.x)) %>% subset(!is.na(log2FoldChange.y)) %>% subset(!is.na(padj.x)) %>% subset(!is.na(padj.y))
+t %>% 
+  subset(padj.x < 0.01 & padj.y < 0.01) %>% 
+  ggplot(aes(x = log2FoldChange.x, y = log2FoldChange.y)) +
+  geom_point() +
+  geom_smooth(method = "lm")
+
+s <- subset(t, padj.x < 0.01 & padj.y < 0.01)
+lm(s$log2FoldChange.x ~ s$log2FoldChange.y)
+```
+
+Overlap (Figure S15D)
+```{r}
+venn::venn(list(Masterfile_corley_2019$Transcript, subset(Masterfile, condition == "PolIC" & time == "24hr")$Transcript), ilabels = "counts")
+
+corley_polic_24hr <- subset(Masterfile_corley_2019)
+quant_4hr_lps <- subset(Masterfile, condition == "PolIC" & time == "24hr")
+
+background <- intersect(Masterfile_corley_2019$Transcript, subset(Masterfile, condition == "PolIC")$Transcript)
+de_both <- Reduce(intersect, list(subset(corley_polic_24hr, padj < 0.01)$Transcript, subset(quant_4hr_lps, padj < 0.01)$Transcript))
+de_none <- background[!background %in% c(subset(corley_polic_24hr, padj < 0.01)$Transcript, subset(quant_4hr_lps, padj < 0.01)$Transcript)]
+de_only_quant <- subset(quant_4hr_lps, padj < 0.01)$Transcript[!subset(quant_4hr_lps, padj < 0.01)$Transcript %in% subset(corley_polic_24hr, padj < 0.01)$Transcript]
+de_only_cor <- subset(corley_polic_24hr, padj < 0.01)$Transcript[!subset(corley_polic_24hr, padj < 0.01)$Transcript %in% subset(quant_4hr_lps, padj < 0.01)$Transcript]
+test <- data.frame(
+  c(length(de_both), length(de_only_cor)),
+  c(length(de_only_quant), length(de_none))
+) %>% fisher.test()
+```
+
+## Bruno et al. 2019 (Figure S15E-F)
+PCA (Figure S15E)
+```{r}
+#The bruno 2019 data is available from PMID: 32839538
+bruno_2019_raw <- read.delim(here::here("validations/data/bruno_2019_merged.csv"), sep = ",")
+for (i in 1:nrow(bruno_2019_raw)) {
+  print(i)
+  rownames(bruno_2019_raw)[i] <- str_split(bruno_2019_raw$geneID[i], "[.]")[[1]][1]
+}
+#rownames(bruno_2019_raw) <- bruno_2019_raw$geneID
+bruno_2019_raw <- bruno_2019_raw %>% dplyr::select(-geneID, -X)
+
+for (i in 1:ncol(bruno_2019_raw)) {
+  colnames(bruno_2019_raw)[i] <- str_split(colnames(bruno_2019_raw)[i], "[.]")[[1]][1]
+}
+
+bruno_2019_metadat <- matrix(ncol = 4, nrow = ncol(bruno_2019_raw))
+
+#Generating a metadata file
+meta <- bruno_2019_metadat
+rownames(meta) <- colnames(bruno_2019_raw)
+
+for (i in 1:length(rownames(meta))) {
+  meta[i, 1] <- rownames(meta)[i]
+  meta[i, 2] <- substr(str_split(meta[i, 1], "_")[[1]][2], 1, 1)
+  meta[i, 3] <- ifelse(str_split(meta[i, 1], "_")[[1]][4] %in% c("4hrs", "24hrs"),
+                       str_split(meta[i, 1], "_")[[1]][3],
+                       paste0(str_split(meta[i, 1], "_")[[1]][3], "_", str_split(meta[i, 1], "_")[[1]][4]))
+  meta[i, 4] <- ifelse(str_split(meta[i, 1], "_")[[1]][4] %in% c("4hrs", "24hrs"),
+                       str_split(meta[i, 1], "_")[[1]][4],
+                       str_split(meta[i, 1], "_")[[1]][5])
+}
+
+meta <- as.data.frame(meta)
+colnames(meta) <- c("id", "donor", "stimulus", "time")
+bruno_2019_metadat <- meta
+
+#Making a nice counts matrix
+bruno_2019_raw <- as.matrix(bruno_2019_raw)
+class(bruno_2019_raw) <- "numeric"
+bruno_2019_raw <- as.data.frame(bruno_2019_raw)
+
+bruno_2019_metadat_4hr <- subset(bruno_2019_metadat, time == "4hrs")
+bruno_2019_metadat_24hr <- subset(bruno_2019_metadat, time == "24hrs")
+
+raw_4hr <- colnames(bruno_2019_raw) %in% bruno_2019_metadat_4hr$id %>% which()
+raw_24hr <- colnames(bruno_2019_raw) %in% bruno_2019_metadat_24hr$id %>% which()
+
+bruno_2019_raw_4hr <- bruno_2019_raw[, raw_4hr] 
+bruno_2019_raw_24hr <- bruno_2019_raw[, raw_24hr] 
+
+dds_bruno_2019_4hr <- DESeqDataSetFromMatrix(
+  countData = bruno_2019_raw_4hr, 
+  colData = bruno_2019_metadat_4hr, 
+  design = ~ donor + stimulus
+  ) %>% 
+  keepFromddsHTSeq %>% 
+  mRNA_function
+
+dds_bruno_2019_4hr$group <- relevel(dds_bruno_2019_4hr$group, ref = "RPMI")
+dds_bruno_2019_4hr <- DESeq(dds_bruno_2019_4hr)
+
+resultsNames(dds_bruno_2019_4hr) # lists the coefficients
+
+res_4hr <- results(dds_bruno_2019_4hr)
+
+opt.cond.long <- c("group_calb_bg_vs_RPMI", 
+                   "group_calb_live_vs_RPMI", 
+                   "group_calb_man_vs_RPMI",
+                   "group_caur_KTCbg_vs_RPMI",
+                   "group_caur_KTClive_vs_RPMI",
+                   "group_caur_KTCman_vs_RPMI")
+
+# or to shrink log fold changes association with condition:
+#resLFC4hrLPS <-         logFoldShrinkage(dds_4hr, opt.cond.long[1])
+res_CAlb_bg_4hr <-      lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[1], type="apeglm")
+res_CAlb_live_4hr <-    lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[2], type="apeglm")
+res_CAlb_man_4hr <-     lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[3], type="apeglm")
+res_CAur_KTCbg_4hr <-   lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[4], type="apeglm")
+res_CAur_KTClive_4hr <- lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[5], type="apeglm")
+res_CAur_KTCman_4hr <-  lfcShrink(dds_bruno_2019_4hr, coef=opt.cond.long[6], type="apeglm")
+
+res_CAlb_bg_4hr <- res_CAlb_bg_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAlb_bg") %>% tibble::rownames_to_column("Transcript")
+res_CAlb_live_4hr <- res_CAlb_live_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAlb_live") %>% tibble::rownames_to_column("Transcript")
+res_CAlb_man_4hr <- res_CAlb_man_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAlb_man") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTCbg_4hr <- res_CAur_KTCbg_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAur_KTCb") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTClive_4hr <- res_CAur_KTClive_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAur_KTClive") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTCman_4hr <- res_CAur_KTCman_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAur_KTCman") %>% tibble::rownames_to_column("Transcript")
+
+res_list_Bruno_2019_4hr <- list(res_CAlb_bg_4hr, res_CAlb_live_4hr, res_CAlb_man_4hr, 
+                                res_CAur_KTCbg_4hr, res_CAur_KTClive_4hr, res_CAur_KTCman_4hr)
+
+
+dds_bruno_2019_24hr <- DESeqDataSetFromMatrix(
+  countData = bruno_2019_raw_24hr, 
+  colData = bruno_2019_metadat_24hr, 
+  design = ~ donor + stimulus
+  ) %>% 
+  keepFromddsHTSeq %>% 
+  mRNA_function
+
+dds_bruno_2019_24hr$group <- relevel(dds_bruno_2019_24hr$group, ref = "RPMI")
+dds_bruno_2019_24hr <- DESeq(dds_bruno_2019_24hr)
+
+resultsNames(dds_bruno_2019_24hr) # lists the coefficients
+
+res_24hr <- results(dds_bruno_2019_24hr)
+
+opt.cond.long <- c("group_calb_bg_vs_RPMI", 
+                   "group_calb_live_vs_RPMI", 
+                   "group_calb_man_vs_RPMI",
+                   "group_caur_KTCbg_vs_RPMI",
+                   "group_caur_KTClive_vs_RPMI",
+                   "group_caur_KTCman_vs_RPMI")
+
+# or to shrink log fold changes association with condition:
+#resLFC4hrLPS <-         logFoldShrinkage(dds_4hr, opt.cond.long[1])
+res_CAlb_bg_24hr <-      lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[1], type="apeglm")
+res_CAlb_live_24hr <-    lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[2], type="apeglm")
+res_CAlb_man_24hr <-     lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[3], type="apeglm")
+res_CAur_KTCbg_24hr <-   lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[4], type="apeglm")
+res_CAur_KTClive_24hr <- lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[5], type="apeglm")
+res_CAur_KTCman_24hr <-  lfcShrink(dds_bruno_2019_24hr, coef=opt.cond.long[6], type="apeglm")
+
+res_CAlb_bg_24hr <- res_CAlb_bg_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAlb_bg") %>% tibble::rownames_to_column("Transcript")
+res_CAlb_live_24hr <- res_CAlb_live_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAlb_live") %>% tibble::rownames_to_column("Transcript")
+res_CAlb_man_24hr <- res_CAlb_man_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAlb_man") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTCbg_24hr <- res_CAur_KTCbg_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAur_KTCbg") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTClive_24hr <- res_CAur_KTClive_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAur_KTClive") %>% tibble::rownames_to_column("Transcript")
+res_CAur_KTCman_24hr <- res_CAur_KTCman_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAur_KTCman") %>% tibble::rownames_to_column("Transcript")
+
+res_list_Bruno_2019_24hr <- list(res_CAlb_bg_24hr, res_CAlb_live_24hr, res_CAlb_man_24hr, 
+                                res_CAur_KTCbg_24hr, res_CAur_KTClive_24hr, res_CAur_KTCman_24hr)
+
+Masterfile_Bruno_2019 <- rbind(
+  ldply(res_list_Bruno_2019_4hr, data.frame), 
+  ldply(res_list_Bruno_2019_24hr, data.frame)) %>% 
+  addUpDown
+
+for (i in 1:nrow(Masterfile_Bruno_2019)) {
+  print(i)
+  Masterfile_Bruno_2019$geneName[i] <- subset(ref_annot, Gene_id == Masterfile_Bruno_2019$Transcript[i])$Gene_name
+}
+
+nrow(Masterfile_Bruno_2019)
+
+for (i in 1:nrow(Masterfile_Bruno_2019)) {
+  if (Masterfile_Bruno_2019$condition[i] == "CAur_KTCb") {
+    Masterfile_Bruno_2019$condition[i] <- "CAur_KTCbg"
+  }
+}
+
+Masterfile_Bruno_2019_padj <- Masterfile_Bruno_2019 %>% getDEGs
+nrow(Masterfile_Bruno_2019_padj)
+
+ddsHTSeq_All <- readRDS(here::here("output/ddsHTSeq_All.rda"))
+main <- counts(ddsHTSeq_All)
+
+bruno_2019_metadat_4hr <- subset(bruno_2019_metadat, time == "4hrs")
+bruno_2019_metadat_24hr <- subset(bruno_2019_metadat, time == "24hrs")
+
+raw_4hr <- colnames(bruno_2019_raw) %in% bruno_2019_metadat_4hr$id %>% which()
+raw_24hr <- colnames(bruno_2019_raw) %in% bruno_2019_metadat_24hr$id %>% which()
+
+ntd_both
+colData(ntd_both) <- cbind(colData(ntd_both), study=c(rep("QuantSeq", 52), rep("Bruno_2019", 42)))
+assay(ntd_both) <- limma::removeBatchEffect(assay(ntd_both), ntd_both$study)
+pcaData <- plotPCA(ntd_both, 
+                   intgroup=c("stimulus", "group"), 
+                   returnData=TRUE
+                   )
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaData$time <- pcaData$group.1
+for (i in 1:nrow(pcaData)) {
+  pcaData$donor[i] <- ifelse(pcaData$name[i] %in% colnames(main), 
+                                             substr(pcaData$name[i], 1, 1),
+                                             paste0(substr(str_split(pcaData$name[i], "_")[[1]][2], 1, 1), "_Bruno"))
+  
+  if(pcaData$time[i] %in% c("4hr", "4hrs")) {pcaData$time[i] <- "4hrs"} 
+  if(pcaData$time[i] %in% c("24hr", "24hrs")) {pcaData$time[i] <- "24hrs"} 
+}
+  
+  pcaData %>%
+    mutate(donor_dataset = ifelse(donor %in% c("A", "B", "C", "D", "E"), "QuantSeq", "Bruno_2019")) %>% 
+    ggplot(aes(x = PC1, y = PC2, shape = interaction(time, donor_dataset), color = stimulus)) +
+    geom_point(size = 4) +
+    scale_color_viridis_d() +
+    ggtitle("Comparing Bruno 2019 and QuantSeq") + 
+    scale_shape_discrete()+
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) +
+    theme(text = element_text(size = 24),
+          aspect.ratio = 1)
+```
+
+DE correlations
+```{r}
+t_1 <- "4hr"
+t_1 <- "24hr"
+stim_bruno <- unique(Masterfile_Bruno_2019$condition)[1:3]
+
+times <- c("4hr", "24hr")
+conds <- stim_bruno
+for (t_1 in times) {
+  for (cond in conds) {
+    print(t_1)
+    print(cond)
+    # t_1 <- times[1]
+    # cond <- conds[1]
+    t <- full_join(
+      Masterfile_Bruno_2019 %>% subset(condition == cond) %>% subset(time == t_1),
+      Masterfile %>% subset(condition == "CAlb") %>% subset(time == t_1),
+      by = "Transcript"
+    ) %>% subset(!is.na(log2FoldChange.x)) %>% subset(!is.na(log2FoldChange.y)) %>% subset(!is.na(padj.x)) %>% subset(!is.na(padj.y))
+
+    s <- subset(t, padj.x < 0.01 & padj.y < 0.01)
+    test <- lm(s$log2FoldChange.x ~ s$log2FoldChange.y)
+
+  }
+}
+
+#Live candida
+#4hr overlapping DEGs (N=80): R2=0.7989, p<2.2e-16
+#24hr overlapping DEGs (N=658): R2=0.07682, p=2.73e-13
+
+#CAlb_bg
+#4hr overlapping DEGs (N=99): R2=0.7583, p<2.2e-16
+#24hr overlapping DEGs (N=233): R2=0.04272, p<2.2e-16
+
+#CAlb_man
+#4hr overlapping DEGs (N=2): Not enough overlap
+#24hr overlapping DEGs (N=41): R2=0.3351, p=4.391e-05
+```
+
+Overlap (Figure S15F)
+```{r}
+tt <- "4hr"
+cond <- "CAlb_bg" 
+cond <- "CAlb_live" 
+cond <- "CAlb_man" 
+
+venn::venn(list(subset(Masterfile_Bruno_2019)$Transcript, subset(Masterfile, condition == "CAlb" & time == tt)$Transcript), ilabels = "counts")
+
+conds <- c("CAlb_bg", "CAlb_live", "CAlb_man")
+times <- c("4hr", "24hr")
+
+for (tt in times) {
+  for (cond in conds) {
+    bruno <- subset(Masterfile_Bruno_2019, time == tt & condition == cond)
+    quant <- subset(Masterfile, condition == "CAlb" & time == tt)
+    
+    background <- intersect(subset(Masterfile_Bruno_2019, time == tt & condition == cond)$Transcript, subset(Masterfile, condition == "CAlb")$Transcript)
+    de_both <- Reduce(intersect, list(subset(bruno, padj < 0.01)$Transcript, subset(quant, padj < 0.01)$Transcript))
+    de_none <- background[!background %in% c(subset(bruno, padj < 0.01)$Transcript, subset(quant, padj < 0.01)$Transcript)]
+    de_only_quant <- subset(quant, padj < 0.01)$Transcript[!subset(quant, padj < 0.01)$Transcript %in% subset(bruno, padj < 0.01)$Transcript]
+    de_only_bruno <- subset(bruno, padj < 0.01)$Transcript[!subset(bruno, padj < 0.01)$Transcript %in% subset(quant, padj < 0.01)$Transcript]
+    test <- data.frame(
+      c(length(de_both), length(de_only_bruno)),
+      c(length(de_only_quant), length(de_none))
+    ) %>% fisher.test()
+  }
+}
+```
+
+## Bruno et al. 2020 (Figure S15G-H)
+PCA (Figure S15G)
+```{r}
+#The bruno 2020 data is available at PMID: 33510868
+bruno_2020_raw <- read.delim(here::here("validations/data/bruno_2020_raw.csv"), sep = ";")
+bruno_2020_metadat <- bruno_2020_raw[1:3, ]
+
+#Generating a metadata file
+meta <- matrix(ncol = 4, nrow = 63)
+rownames(meta) <- colnames(bruno_2020_metadat)[2:ncol(bruno_2020_metadat)]
+meta[, 1] <- colnames(bruno_2020_metadat)[2:ncol(bruno_2020_metadat)]
+meta[, 2] <- as.matrix(bruno_2020_metadat[2, 2:ncol(bruno_2020_metadat)])
+meta[, 3] <- as.matrix(bruno_2020_metadat[1, 2:ncol(bruno_2020_metadat)])
+meta[, 4] <- as.matrix(bruno_2020_metadat[3, 2:ncol(bruno_2020_metadat)])
+meta <- as.data.frame(meta)
+colnames(meta) <- c("id", "stimulus", "time", "donor")
+bruno_2020_metadat <- meta
+
+#Making a nice counts matrix
+bruno_2020_raw <- bruno_2020_raw[4:nrow(bruno_2020_raw), ]
+rownames(bruno_2020_raw) <- bruno_2020_raw$X
+bruno_2020_raw <- bruno_2020_raw %>% dplyr::select(-X)
+bruno_2020_raw <- as.matrix(bruno_2020_raw)
+class(bruno_2020_raw) <- "numeric"
+bruno_2020_raw <- as.data.frame(bruno_2020_raw)
+
+bruno_2020_metadat_4hr <- subset(bruno_2020_metadat, time == "4h")
+bruno_2020_metadat_24hr <- subset(bruno_2020_metadat, time == "24h")
+
+raw_4hr <- colnames(bruno_2020_raw) %in% bruno_2020_metadat_4hr$id %>% which()
+raw_24hr <- colnames(bruno_2020_raw) %in% bruno_2020_metadat_24hr$id %>% which()
+
+bruno_2020_raw_4hr <- bruno_2020_raw[, raw_4hr] 
+bruno_2020_raw_24hr <- bruno_2020_raw[, raw_24hr] 
+
+dds_bruno_2020_4hr <- DESeqDataSetFromMatrix(
+  countData = bruno_2020_raw_4hr, 
+  colData = bruno_2020_metadat_4hr, 
+  design = ~ donor + stimulus
+  ) %>% 
+  keepFromddsHTSeq %>% 
+  mRNA_function
+
+dds_bruno_2020_4hr$group <- relevel(dds_bruno_2020_4hr$group, ref = "RPMI")
+dds_bruno_2020_4hr <- DESeq(dds_bruno_2020_4hr)
+
+resultsNames(dds_bruno_2020_4hr) # lists the coefficients
+
+res_4hr <- results(dds_bruno_2020_4hr)
+
+opt.cond.long <- c("group_Candida.albicans_vs_RPMI", 
+                   "group_Aspergillus.fumigatus_vs_RPMI", 
+                   "group_Rhizopus.oryzae_vs_RPMI")
+
+# or to shrink log fold changes association with condition:
+res_CAlb_4hr <- lfcShrink(dds_bruno_2020_4hr, coef=opt.cond.long[1], type="apeglm")
+res_AFum_4hr <- lfcShrink(dds_bruno_2020_4hr, coef=opt.cond.long[2], type="apeglm")
+res_ROrz_4hr <- lfcShrink(dds_bruno_2020_4hr, coef=opt.cond.long[3], type="apeglm")
+
+res_CAlb_4hr <- res_CAlb_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "CAlb") %>% tibble::rownames_to_column("Transcript")
+res_AFum_4hr <- res_AFum_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "AFum") %>% tibble::rownames_to_column("Transcript")
+res_ROrz_4hr <- res_ROrz_4hr %>% as.data.frame() %>% mutate(time = "4hr") %>% mutate(condition = "ROrz") %>% tibble::rownames_to_column("Transcript")
+res_list_Bruno_2020_4hr <- list(res_CAlb_4hr, res_AFum_4hr, res_ROrz_4hr)
+
+dds_bruno_2020_24hr <- DESeqDataSetFromMatrix(
+  countData = bruno_2020_raw_24hr, 
+  colData = bruno_2020_metadat_24hr, 
+  design = ~ donor + stimulus
+  ) %>% 
+  keepFromddsHTSeq %>% 
+  mRNA_function
+
+
+dds_bruno_2020_24hr$group <- relevel(dds_bruno_2020_24hr$group, ref = "RPMI")
+dds_bruno_2020_24hr <- DESeq(dds_bruno_2020_24hr)
+
+resultsNames(dds_bruno_2020_24hr) # lists the coefficients
+
+res_24hr <- results(dds_bruno_2020_24hr)
+
+opt.cond.long <- c("group_Candida.albicans_vs_RPMI", 
+                   "group_Aspergillus.fumigatus_vs_RPMI", 
+                   "group_Rhizopus.oryzae_vs_RPMI")
+
+# or to shrink log fold changes association with condition:
+#resLFC24hrLPS <-         logFoldShrinkage(dds_24hr, opt.cond.long[1])
+res_CAlb_24hr <- lfcShrink(dds_bruno_2020_24hr, coef=opt.cond.long[1], type="apeglm")
+res_AFum_24hr <- lfcShrink(dds_bruno_2020_24hr, coef=opt.cond.long[2], type="apeglm")
+res_ROrz_24hr <- lfcShrink(dds_bruno_2020_24hr, coef=opt.cond.long[3], type="apeglm")
+
+res_CAlb_24hr <- res_CAlb_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "CAlb") %>% tibble::rownames_to_column("Transcript")
+res_AFum_24hr <- res_AFum_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "AFum") %>% tibble::rownames_to_column("Transcript")
+res_ROrz_24hr <- res_ROrz_24hr %>% as.data.frame() %>% mutate(time = "24hr") %>% mutate(condition = "ROrz") %>% tibble::rownames_to_column("Transcript")
+res_list_Bruno_2020_24hr <- list(res_CAlb_24hr, res_AFum_24hr, res_ROrz_24hr)
+
+Masterfile_Bruno_2020 <- rbind(
+  ldply(res_list_Bruno_2020_4hr, data.frame), 
+  ldply(res_list_Bruno_2020_24hr, data.frame)) %>% 
+  addUpDown
+
+for (i in 1:nrow(Masterfile_Bruno_2020)) {
+  Masterfile_Bruno_2020$geneName[i] <- subset(ref_annot, Gene_id == Masterfile_Bruno_2020$Transcript[i])$Gene_name
+}
+
+Masterfile_Bruno_2020_padj <- Masterfile_Bruno_2020 %>% getDEGs
+```
+
+DE correlations
+```{r}
+t_1 <- "4hr"
+t_1 <- "24hr"
+times <- c("4hr", "24hr")
+for (t_1 in times) {
+    t <- full_join(
+      Masterfile_Bruno_2020 %>% subset(condition == "CAlb") %>% subset(time == t_1),
+      Masterfile %>% subset(condition == "CAlb") %>% subset(time == t_1),
+      by = "Transcript"
+    ) %>% subset(!is.na(log2FoldChange.x)) %>% subset(!is.na(log2FoldChange.y)) %>% subset(!is.na(padj.x)) %>% subset(!is.na(padj.y))
+
+    
+    s <- subset(t, padj.x < 0.01 & padj.y < 0.01)
+    test <- lm(s$log2FoldChange.x ~ s$log2FoldChange.y) 
+}
+
+#4hr overlapping DEGs (N=325): R2=0.8215, p<2.2e-16
+#24hr overlapping DEGs (N=1215): R2=0.7613, p<2.2e-16
+```
+
+Overlap (Figure S15H)
+```{r}
+times <- c("4hr", "24hr")
+for (tt in times) {
+  bruno_calb_4hr <- subset(Masterfile_Bruno_2020, time == tt & condition == "CAlb")
+  quant <- subset(Masterfile, condition == "CAlb" & time == tt)
+  
+  background <- intersect(subset(Masterfile_Bruno_2020, time == tt & condition == "CAlb")$Transcript, subset(Masterfile, condition == "CAlb")$Transcript)
+  de_both <- Reduce(intersect, list(subset(bruno_calb_4hr, padj < 0.01)$Transcript, subset(quant, padj < 0.01)$Transcript))
+  de_none <- background[!background %in% c(subset(bruno_calb_4hr, padj < 0.01)$Transcript, subset(quant, padj < 0.01)$Transcript)]
+  de_only_quant <- subset(quant, padj < 0.01)$Transcript[!subset(quant, padj < 0.01)$Transcript %in% subset(bruno_calb_4hr, padj < 0.01)$Transcript]
+  de_only_bruno <- subset(bruno_calb_4hr, padj < 0.01)$Transcript[!subset(bruno_calb_4hr, padj < 0.01)$Transcript %in% subset(quant, padj < 0.01)$Transcript]
+  test <- data.frame(
+    c(length(de_both), length(de_only_bruno)),
+    c(length(de_only_quant), length(de_none))
+  ) %>% fisher.test()
+}
+```
+
+# Functional classification (Figure 4A-B, S6A-C and S14A)
+Numbers (Figure S14A)
+```{r}
+nudge = 30
+conditions <- Masterfile_padj %>%
+  group_by(`time-point`, condition, direction, funct.class) %>%
+  summarize(n = n()) %>% 
+  mutate(type = paste0(`time-point`, "_", condition, "_", direction)) %>% 
+  group_by(type) %>%
+  mutate(total = sum(n)) %>%
+  mutate(rel = n / total) %>% 
+  fixTimeOrder %>% 
+  fixConditionOrder %>% 
+  mutate(n = ifelse(direction == "down", -n, n)) %>%
+  mutate(rel = ifelse(direction == "down", -rel, rel)) %>% 
+  mutate(total_pos = ifelse(direction == "down", -total-nudge, total+nudge))
+
+#Custom condition order
+conditions$funct.class <- factor(conditions$funct.class, levels = c("uncharacterized", "other", "imm.ass", "PID"))
+
+conditions %>% 
+  ggplot()+
+  geom_col(aes(x = `time-point`, y = n, fill = funct.class))+
+  geom_text(aes(x = `time-point`, y = total_pos, label = total), size = 5) +
+  scale_fill_viridis_d(limits = c("uncharacterized", "other", "imm.ass", "PID")) +
+  #scale_fill_viridis_d(begin = 0, end = 1)+
+  labs(x = "Time-point", y = "Differentially expressed genes (N)") +
+  facet_grid(~condition)+
+  geom_hline(yintercept = 0, linetype="dashed", color = "grey")+
+  theme_bw()+
+  theme(legend.position="top", text=element_text(size=26))
+```
+
+Relative (Figure 4A)
+```{r}
+rel_funct_class <- Masterfile_padj %>%
+  mutate(funct.class = ifelse(uniprot_rev_score %in% c(1, 2), "uncharacterized", funct.class)) %>%
+  mutate(funct.class = ifelse(is.na(funct.class), "other", funct.class)) %>% 
+  group_by(`time-point`, condition, funct.class) %>%
+  summarize(n = n()) %>%
+  group_by(condition, `time-point`) %>% 
+  mutate(total_cond = sum(n)) %>% 
+  mutate(rel = n / total_cond) %>% 
+  fixTimeOrder %>% 
+  fixConditionOrder %>% 
+  dplyr::select(-n, -total_cond) %>% 
+  ungroup() %>% 
+  tidyr::complete(`time-point`, condition, funct.class, fill = list(rel = 0))
+
+
+  t <- rel_funct_class %>% mutate(perc = 100*rel)
+  t$funct.class <- factor(t$funct.class, levels = c("other", "imm.ass", "PID", "uncharacterized"))
+  cond <- unique(t$condition)
+  
+  t %>% 
+    ggplot(aes(x = perc, y = `time-point`, fill = funct.class)) +
+    geom_col(width = 0.5) +
+    #scale_x_discrete(limits = c(" ", "4hr","24hr")) +
+    scale_fill_brewer("Blues") +
+    #coord_polar("y") +
+    labs(x = "Percentage of DEGs", y = "Time point") +
+    facet_grid(condition~.) +
+    theme_bw() +
+    theme(text = element_text(size = 22))
+```
+
+## FMUG (Figure S6A-C)
+```{r}
+#FMUG data available at PMID 38546716
+fmug <- read.csv(here::here("data/main_table.csv"))
+fmug_cols <- read.csv(here::here("data/main_table_columns.csv"))
+
+Masterfile_fmug <- left_join(Masterfile %>% dplyr::rename(gene_ensembl = Transcript), fmug, by = "gene_ensembl") %>% 
+  mutate(char = ifelse(funct.class == "uncharacterized", F, T))
+```
+
+Statistics
+```{r}
+deg <- subset(Masterfile, deg == "deg")$Transcript %>% unique()
+non_deg <- subset(Masterfile, deg == "non-deg")$Transcript %>% unique()
+non_deg <- non_deg[!non_deg %in% deg]
+
+fmug_annot <- fmug %>% mutate(de_quant = ifelse(gene_ensembl %in% deg, T,
+                                                ifelse(gene_ensembl %in% non_deg, F, NA)))
+
+fmug_annot %>% dplyr::count(de_quant)
+
+nrow(fmug_annot)
+100* (length(intersect(c(deg, non_deg), unique(fmug_annot$gene_ensembl))) / length(c(deg, non_deg)))
+100* (length(intersect(deg, unique(fmug_annot$gene_ensembl))) / length(deg))
+venn::venn(list(c(deg, non_deg), unique(fmug_annot$gene_ensembl)), ilabel = "counts", snames = "quant, fmug")
+venn::venn(list(deg, non_deg, unique(fmug_annot$gene_ensembl)), ilabel = "counts", snames = "deg, non-deg, fmug")
+
+length(deg[!deg %in% fmug_annot$gene_ensembl]) / length(deg)
+length(deg[!non_deg %in% fmug_annot$gene_ensembl]) / length(non_deg)
+
+subset(Masterfile_fmug, !is.na(n_pubs)) %>% nrow()
+
+#Testing for a difference in publications between characterized and uncharacterized DEGs
+Masterfile_fmug %>% 
+  subset(deg == "deg") %>% 
+  ggplot(aes(x = char, y = n_pubs)) +
+  geom_boxplot()
+
+na.omit(subset(Masterfile_fmug, deg == "deg" & char == T)$n_pubs) %>% mean()
+na.omit(subset(Masterfile_fmug, deg == "deg" & char == T)$n_pubs) %>% median()
+na.omit(subset(Masterfile_fmug, deg == "deg" & char == F)$n_pubs) %>% mean()
+na.omit(subset(Masterfile_fmug, deg == "deg" & char == F)$n_pubs) %>% median()
+wilcox.test(na.omit(subset(Masterfile_fmug, deg == "deg" & char == T)$n_pubs), 
+            na.omit(subset(Masterfile_fmug, deg == "deg" & char == F)$n_pubs))
+
+#Testing for a difference in publications between DEGs and all other genes
+fmug_annot %>% 
+  ggplot(aes(x = de_quant, y = n_pubs)) +
+  geom_boxplot()
+
+na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == T]) %>% mean()
+na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == T]) %>% median()
+
+na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == F]) %>% mean()
+na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == F]) %>% median()
+
+wilcox.test(na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == T]), na.omit(fmug_annot$n_pubs[fmug_annot$de_quant == F]))
+```
+
+Overlap (Figure S6A-B)
+```{r}
+fmug_overlap <- venn::venn(list(unique(Masterfile$Transcript), unique(Masterfile_padj$Transcript), fmug$gene_ensembl), 
+           ilabels = "counts", snames = "All genes, DEGs, FMUG", box = F, ggplot = T, sncs = 1.2, ilcs = 1.5)
+
+ggsave(here::here("figures/fmug_overlap.pdf"), device = "pdf", height = 6, width = 8, plot = fmug_overlap)
+
+fmug_overlap_char_unchar <- venn::venn(list(
+  unique(subset(Masterfile_padj, uniprot_unchar == "uncharacterized")$Transcript), 
+  unique(subset(Masterfile_padj, uniprot_unchar == "characterized")$Transcript), 
+  fmug$gene_ensembl), 
+           ilabels = "counts", snames = "Uncharacterized, Characterized, FMUG", box = F, ggplot = T, sncs = 1.2, ilcs = 1.5)
+```
+
+Violin plot (Figure S6C)
+```{r}
+colnames(Masterfile_fmug)
+fmug_diff <- Masterfile_fmug %>% subset(deg == "deg") %>% 
+  dplyr::select(geneName, characterized = char, funct.class, n_pubs) %>% unique()
+
+fmug_diff %>% 
+  ggplot(aes(x = characterized, y = log10(n_pubs + 1))) +
+  geom_violin(aes(fill = characterized)) +
+  geom_boxplot(width=0.1, alpha=0.2) +
+  stat_compare_means() +
+  labs(x = "Characterized", y = "log10(N publicactions + 1)") +
+  theme_classic() +
+  theme(text = element_text(size = 16), legend.position = "none")
+```
+
+Overlap uncharacterized genes (Figure 4B)
+```{r}
+LPS_unchar_24hr <- subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2)) %>% getGenes() 
+PolIC_unchar_24hr <- subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2)) %>% getGenes() 
+SAur_unchar_24hr <- subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2)) %>% getGenes() 
+CAlb_unchar_24hr <- subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2)) %>% getGenes() 
+
+LPS_unchar_4hr_up <- subset(Masterfile_padj, condition == "LPS" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes() 
+SAur_unchar_4hr_up <- subset(Masterfile_padj, condition == "SAur" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+PolIC_unchar_4hr_up <- subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+CAlb_unchar_4hr_up <- subset(Masterfile_padj, condition == "CAlb" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+
+LPS_unchar_24hr_up <- subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes() 
+SAur_unchar_24hr_up <- subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+PolIC_unchar_24hr_up <- subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+CAlb_unchar_24hr_up <- subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "up") %>% getGenes()
+
+LPS_unchar_4hr_down <- subset(Masterfile_padj, condition == "LPS" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes() 
+SAur_unchar_4hr_down <- subset(Masterfile_padj, condition == "SAur" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+PolIC_unchar_4hr_down <- subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+CAlb_unchar_4hr_down <- subset(Masterfile_padj, condition == "CAlb" & `time-point` == "4hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+
+LPS_unchar_24hr_down <- subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes() 
+SAur_unchar_24hr_down <- subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+PolIC_unchar_24hr_down <- subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+CAlb_unchar_24hr_down <- subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & uniprot_rev_score %in% c(1, 2) & direction == "down") %>% getGenes()
+
+ggarrange(
+  venn::venn(list(
+    LPS_unchar_4hr_up,
+    CAlb_unchar_4hr_up,
+    PolIC_unchar_4hr_up,
+    SAur_unchar_4hr_up
+  ), ggplot = TRUE,
+  ilcs = 1.5,
+  sncs = 1.5,
+  ilabel = "counts",
+  snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+  box = F,
+  zcolor = as.vector(viridis::viridis_pal()(5)[2:5])),
+  
+  venn::venn(list(
+    LPS_unchar_4hr_down,
+    CAlb_unchar_4hr_down,
+    PolIC_unchar_4hr_down,
+    SAur_unchar_4hr_down
+  ), ggplot = TRUE,
+  ilcs = 1.5,
+  sncs = 1.5,
+  ilabel = "counts",
+  snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+  box = F,
+  zcolor = as.vector(viridis::viridis_pal()(5)[2:5])),
+  
+  venn::venn(list(
+    LPS_unchar_24hr_up,
+    CAlb_unchar_24hr_up,
+    PolIC_unchar_24hr_up,
+    SAur_unchar_24hr_up
+  ), ggplot = TRUE,
+  ilcs = 1.5,
+  sncs = 1.5,
+  ilabel = "counts",
+  snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+  box = F,
+  zcolor = as.vector(viridis::viridis_pal()(5)[2:5])),
+  
+  venn::venn(list(
+    LPS_unchar_24hr_down,
+    CAlb_unchar_24hr_down,
+    PolIC_unchar_24hr_down,
+    SAur_unchar_24hr_down
+  ), ggplot = TRUE,
+  ilcs = 1.5,
+  sncs = 1.5,
+  ilabel = "counts",
+  snames = "LPS, C. albicans, Poly(I:C), S. aureus",
+  box = F,
+  zcolor = as.vector(viridis::viridis_pal()(5)[2:5]))
+)
+```
+
+# Functional enrichment of DEGs (Figure 3D, S14G and S16A-B)
+Enrichment analysis (Figure 3D)
+```{r}
+degs_4hr_core <- c( 
+  Reduce(intersect, list(subset(Masterfile_padj, condition == "LPS" & `time-point` == "4hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "CAlb" & `time-point` == "4hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "SAur" & `time-point` == "4hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "PolIC" & `time-point` == "4hr" & direction == "up")$geneName))
+)
+degs_24hr_core <- c( 
+  Reduce(intersect, list(subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & direction == "up")$geneName,
+                         subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & direction == "up")$geneName)),
+  Reduce(intersect, list(subset(Masterfile_padj, condition == "LPS" & `time-point` == "24hr" & direction == "down")$geneName,
+                         subset(Masterfile_padj, condition == "CAlb" & `time-point` == "24hr" & direction == "down")$geneName,
+                         subset(Masterfile_padj, condition == "SAur" & `time-point` == "24hr" & direction == "down")$geneName,
+                         subset(Masterfile_padj, condition == "PolIC" & `time-point` == "24hr" & direction == "down")$geneName))
+)
+
+immune_core_deg_4 <- fisherGeneList(core = degs_4hr_core, 
+                                    other = unique(subset(Masterfile_padj, `time-point` == "4hr")$geneName), 
+                                    geneset = imm.ass)
+PID_core_deg_4 <- fisherGeneList(core = degs_4hr_core, 
+                                 other = unique(subset(Masterfile_padj, `time-point` == "4hr")$geneName), 
+                                 geneset = PID)
+mouse_core_deg_4 <- fisherGeneList(core = degs_4hr_core, 
+                                   other = unique(subset(Masterfile_padj, `time-point` == "4hr")$geneName), 
+                                   geneset = mouse_immu_genes)
+
+immune_core_deg_24 <- fisherGeneList(core = degs_24hr_core, 
+                                     other = unique(subset(Masterfile_padj, `time-point` == "24hr")$geneName), 
+                                     geneset = imm.ass)
+PID_core_deg_24 <- fisherGeneList(core = degs_24hr_core, 
+                                  other = unique(subset(Masterfile_padj, `time-point` == "24hr")$geneName), 
+                                  geneset = PID)
+mouse_core_deg_24 <- fisherGeneList(core = degs_24hr_core, 
+                                    other = unique(subset(Masterfile_padj, `time-point` == "24hr")$geneName), 
+                                    geneset = mouse_immu_genes)
+
+
+core_deg_time <- list(immune_core_deg_4, 
+                      PID_core_deg_4, 
+                      mouse_core_deg_4,
+                      immune_core_deg_24,
+                      PID_core_deg_24,
+                      mouse_core_deg_24)
+
+core_deg_time_stats <- do.call(rbind,
+        lapply(core_deg_time, 
+               function(t) data.frame(p_val = t$p.value, conf.int_1 = t$conf.int[1], conf.int_2 = t$conf.int[2], estimate = t$estimate)))
+core_deg_time_stats$set <- c("immune_core_deg_4", "PID_core_deg_4", "mouse_core_deg_4",
+                             "immune_core_deg_24", "PID_core_deg_24", "mouse_core_deg_24")
+
+core_deg_time_stats$time <- sapply(core_deg_time_stats$set, function(t) str_split(t, "_") %>% purrr::map_chr(.,4))
+core_deg_time_stats$geneset <- sapply(core_deg_time_stats$set, function(t) str_split(t, "_") %>% purrr::map_chr(.,1))             
+
+
+core_deg_time_stats$geneset[core_deg_time_stats$geneset == "PID"] <- "IEI"
+core_deg_time_stats$geneset[core_deg_time_stats$geneset == "mouse"] <- "Mouse immune"
+core_deg_time_stats$geneset[core_deg_time_stats$geneset == "immune"] <- "Immune"
+core_deg_time_stats$geneset <- factor(core_deg_time_stats$geneset, levels = c("IEI", "Mouse immune", "Immune"))
+
+core_deg_time_stats$time[core_deg_time_stats$time == "4"] <- "4 hours"
+core_deg_time_stats$time[core_deg_time_stats$time == "24"] <- "24 hours"
+core_deg_time_stats$time <- factor(core_deg_time_stats$time, levels = c("24 hours", "4 hours"))
+
+
+n_tests <- nrow(core_deg_time_stats)
+#Correcting the CI's to reflect the Bonferroni correction
+alpha_adjusted <- 0.01 / n_tests
+core_deg_time_stats$conf.int_1_adj <- core_deg_time_stats$conf.int_1 - (1 - alpha_adjusted) / 2
+core_deg_time_stats$conf.int_2_adj <- core_deg_time_stats$conf.int_2 + (1 - alpha_adjusted) / 2
+
+core_deg_time_stats %>% 
+  mutate(padj = p_val * nrow(core_deg_time_stats)) %>% 
+  mutate(padj = ifelse(padj > 1, 1, padj)) %>% 
+  mutate(stars = stars.pval(padj)) %>% 
+  ggplot(aes(x = estimate, y = geneset, color = time)) +
+  geom_point(position = position_dodge(width = 0.9), size = 3.5) +
+  geom_errorbarh(aes(xmax = conf.int_1_adj, xmin = conf.int_2_adj), size = .5, position = position_dodge(width = 0.9), height = 0) +
+  geom_vline(aes(xintercept = 1), size = .25, linetype = "dashed") +
+  scale_color_manual(values = c("#72727e", "#b0bcb0")) +
+  labs(x = "OR", y = "Geneset", color = "Time point") +
+  theme_bw() +
+  theme(text = element_text(size = 21), legend.position = "top")
+```
+
+HPO analysis (Figure 3E)
+```{r}
+core_4hr_up_gprof <- gprofiler2::gost(query = Reduce(intersect, list(subset(LPS, `time-point` == "4hr" & direction == "up")$geneName, subset(CAlb, `time-point` == "4hr" & direction == "up")$geneName, subset(PolIC, `time-point` == "4hr" & direction == "up")$geneName, subset(SAur, `time-point` == "4hr" & direction == "up")$geneName)), 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = "GO:BP", as_short_link = FALSE)
+core_4hr_up_gprof$result
+nrow(core_4hr_up_gprof$result)
+
+core_24hr_up_gprof <- gprofiler2::gost(query = Reduce(intersect, list(subset(LPS, `time-point` == "24hr" & direction == "up")$geneName, subset(CAlb, `time-point` == "24hr" & direction == "up")$geneName, subset(PolIC, `time-point` == "24hr" & direction == "up")$geneName, subset(SAur, `time-point` == "24hr" & direction == "up")$geneName)), 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = "GO:BP", as_short_link = FALSE)
+core_24hr_up_gprof$result
+nrow(core_24hr_up_gprof$result)
+
+core_24hr_down_gprof <- gprofiler2::gost(query = Reduce(intersect, list(subset(LPS, `time-point` == "24hr" & direction == "down")$geneName, subset(CAlb, `time-point` == "24hr" & direction == "down")$geneName, subset(PolIC, `time-point` == "24hr" & direction == "down")$geneName, subset(SAur, `time-point` == "24hr" & direction == "down")$geneName)), 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = "GO:BP", as_short_link = FALSE)
+core_24hr_down_gprof$result
+```
+
+IEI enrichment (Figure S14G)
+```{r}
+quant_iuis <- readxl::read_xlsx(here::here("data/quantseq_IEI_classification.xlsx"), sheet = "Sheet1") #This list has been checked for all table 6 IUIS genes (11-02-2025)
+
+table6_genes <- quant_iuis[grep("6", quant_iuis$table),]$gene_quant
+nottable6_genes <- quant_iuis[!grepl("6", quant_iuis$table),]$gene_quant
+
+
+LPS <- subset(Masterfile_padj, condition == "LPS")$geneName
+CAlb <- subset(Masterfile_padj, condition == "CAlb")$geneName
+PolIC <- subset(Masterfile_padj, condition == "PolIC")$geneName
+SAur <- subset(Masterfile_padj, condition == "SAur")$geneName
+
+all_DEG <- c(LPS, CAlb, PolIC, SAur) %>% unique()
+
+table6_enrichment <- fisherGeneList(core = overlap, other = all_DEG, geneset = table6_genes, conf = 0.99)
+nottable6_enrichment <- fisherGeneList(core = overlap, other = all_DEG, geneset = nottable6_genes, conf = 0.99)
+
+
+table6_tests <- do.call(rbind, lapply(list(table6_enrichment, nottable6_enrichment), 
+                                      function(t) data.frame(p_val = t$p.value, 
+                                                             conf.int_1 = t$conf.int[1], 
+                                                             conf.int_2 = t$conf.int[2], 
+                                                             estimate = t$estimate))) %>% tibble::rownames_to_column("set") %>% 
+  mutate(padj = p_val*2)
+
+table6_tests$geneset <- c("IEI innate immunity", "IEI non-innate immunity")
+table6_tests$geneset <- factor(table6_tests$geneset, levels = c("IEI innate immunity", "IEI non-innate immunity"))  
+
+table6_tests_plot <- table6_tests %>% 
+  mutate(label = paste0("Padj=", scales::scientific(padj, digits = 3))) %>% 
+  mutate(lab_x = 0.05) %>% 
+  ggplot(aes(y = geneset, fill = geneset, label = label)) +
+  geom_col(aes(x = -log10(padj))) +
+  geom_text(aes(x = lab_x), size = 2, hjust = 0) +
+  geom_vline(xintercept = -log10(0.01)) +
+  xlab(expression('-log'[10]*"Padj")) +
+  ylab("Geneset") +
+  xlim(0, 3) +
+  theme_classic() +
+  theme(legend.position = "none")
+```
+
+## Cell type specific expression  (Figure S16A-B)
+```{r}
+#Cell type specific genes can be obtained from dice https://dice-database.org/#
+unique_genes_files <- list.files(here::here("data/unique_expression"))
+unique_genes <- list()
+
+for (file in unique_genes_files) {
+  #file <- unique_genes_files[1]
+  unique_genes <- rlist::list.append(
+    unique_genes,
+    read.csv(paste0(here::here("ext_data/DICE/unique_expression/"), file)) %>% mutate(file = file)
+  )
+}
+unique_genes_full <- unique_genes
+unique_genes <- lapply(unique_genes, function(x) return(x$Gene.name))
+names(unique_genes) <- sapply(unique_genes_files, function(t) stringr::str_split(t, "[.]") %>% purrr::map_chr(.,1))
+
+unique_genes_full <- do.call(rbind, unique_genes_full)
+```
+
+Enrichment (Figure S16A)
+```{r}
+dice_celltypes_gsea <- rbind(
+  GSEASimple(dds_4hr, test = "LPS", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "C_Albicans", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "S_Aureus", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "PolyIC", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  
+  GSEASimple(dds_24hr, test = "LPS", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "C_Albicans", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "S_Aureus", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "PolyIC", control = "RPMI", pathways = unique_genes, time = "24hr")
+)
+
+dice_celltypes_gsea <- dice_celltypes_gsea %>% 
+    mutate(condition = ifelse(condition == "C_Albicans", glue("<i>C. albicans<i>"), 
+                       ifelse(condition == "S_Aureus", glue("<i>S. aureus<i>"), 
+                              ifelse(condition == "PolyIC", "Poly(I:C)",
+                                     ifelse(condition == "LPS", "LPS", condition)))))
+
+dice_celltypes_gsea$condition <- factor(dice_celltypes_gsea$condition, levels = c("LPS", "<i>C. albicans<i>", "Poly(I:C)", "<i>S. aureus<i>"))
+
+dice_celltypes_gsea_plot <- dice_celltypes_gsea %>% 
+  mutate(star_pval = gtools::stars.pval(padj)) %>% 
+  mutate(star_pval = ifelse(padj > 0.05, "", star_pval)) %>% 
+  mutate(time_point = factor(time_point, levels = c("4hr", "24hr"))) %>% 
+  ggplot(aes(x = condition, y = pathway, fill = NES, label = star_pval)) +
+  geom_tile() +
+  geom_text() +
+  labs(x = "Condition", y = "Gene set") +
+  scale_fill_gradient2(high = muted("red"), mid = "white", low = muted("blue")) +
+  facet_grid(~time_point) +
+  theme_bw() +
+  theme(text = element_text(size = 20), legend.position = "none", axis.text.x = ggtext::element_markdown(angle = 45, vjust = 1, hjust=1))
+```
+
+Functional enrichment of NK-specific genes (Figure S16B)
+```{r}
+dice_celltypes_gsea <- rbind(
+  GSEASimple(dds_4hr, test = "LPS", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "C_Albicans", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "S_Aureus", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  GSEASimple(dds_4hr, test = "PolyIC", control = "RPMI", pathways = unique_genes, time = "4hr"),
+  
+  GSEASimple(dds_24hr, test = "LPS", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "C_Albicans", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "S_Aureus", control = "RPMI", pathways = unique_genes, time = "24hr"),
+  GSEASimple(dds_24hr, test = "PolyIC", control = "RPMI", pathways = unique_genes, time = "24hr")
+)
+
+nk_leading_edge_all <- do.call(c, subset(dice_celltypes_gsea, time_point == "24hr" & pathway == "NK")$leadingEdge) %>% unique()
+nk_leading_edge_all_gprof <- gprofiler2::gost(nk_leading_edge_all)
+
+nk_leading_edge_all_gprof_plot <- nk_leading_edge_all_gprof$result %>% subset(term_size < 500 & term_size > 100) %>% subset(source == "GO:BP") %>% 
+  mutate(log10p = -log10(p_value)) %>% 
+  ggplot(aes(x = log10p, y = reorder(term_name, log10p), fill = source)) +
+  geom_col() +
+  xlab(expression('-log'[10]*"P")) +
+  labs(y = "Term name", fill = "Source") +
+  theme_classic() +
+  theme(text = element_text(size = 16), axis.ticks.y = element_blank(), legend.position = "top")
+```
+
+# GWAS hits associated with pathogen response DEGs (Figure S7A-D)
+Gathering the genes per trait reported in the GWAS catalog
+```{r}
+#The gwas hits are available from https://www.ebi.ac.uk/gwas/
+associations <- read.table(here::here("data/associations_v1.0.2.txt"), quote="", fill=FALSE, sep = "\t", header = T)
+
+genes_per_trait <- list()
+traits <- unique(associations$MAPPED_TRAIT)
+
+for (trait in traits) {
+  t <- subset(associations, MAPPED_TRAIT == trait)
+  
+  snp_genes <- sapply(t$SNP_GENE_IDS, function(t) str_split(t, ", ")) %>% unlist()
+  snp_genes <- snp_genes[snp_genes != ""]
+  names(snp_genes) <- NULL
+  genes <- snp_genes %>% unique()
+
+  genes_per_trait <- rlist::list.append(genes_per_trait, genes)
+  names(genes_per_trait)[length(genes_per_trait)] <- trait
+}
+genes_per_trait_stats <- lapply(genes_per_trait, length) %>% as.data.frame() %>% t() %>% as.data.frame() %>% tibble::rownames_to_column("id") %>% rename(n = V1)
+mean(genes_per_trait_stats$n)
+median(genes_per_trait_stats$n)
+```
+
+Number of genes per trait (Figure S7A)
+```{r}
+genes_per_trait_stats <- data.frame(genes = sapply(genes_per_trait, length)) 
+
+min(genes_per_trait_stats$genes)
+max(genes_per_trait_stats$genes)
+mean(genes_per_trait_stats$genes)
+median(genes_per_trait_stats$genes)
+
+genes_per_trait_stats_n <- genes_per_trait_stats %>% 
+  mutate(cut = cut(genes, breaks = c(-1, 0, 1, 10, 100, 1000, Inf))) %>% 
+  count(cut)
+
+genes_per_trait_stats_n$cut <- as.character(genes_per_trait_stats_n$cut)
+genes_per_trait_stats_n$cut[genes_per_trait_stats_n$cut == "(-1,0]"] <- 0
+genes_per_trait_stats_n$cut[genes_per_trait_stats_n$cut == "(0,1]"] <- 1
+genes_per_trait_stats_n$cut <- factor(genes_per_trait_stats_n$cut, levels = c("0", "1", "(1,10]", "(10,100]", "(100,1e+03]", "(1e+03,Inf]"))
+
+genes_per_trait_stats_binned <- genes_per_trait_stats_n %>% 
+  ggplot(aes(x = cut, y = n, label = n)) + 
+  geom_col() +
+  geom_text(nudge_y = 100) +
+  geom_vline(xintercept = 10) +
+  labs(x = "Genes (N)", y = "Traits (N)") + 
+  theme_classic() + theme(text = element_text(size = 16), axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Enrichment tests
+```{r}
+#Doing the enrichment tests for each time point and condition separately
+cond <- unique(Masterfile$condition)
+time <- unique(Masterfile$`time-point`)
+gwas_test_out <- list()
+
+for (c in cond) {
+  for (t in time) {
+    # c <- cond[1]
+    # t <- time[1]
+    dat <-  subset(Masterfile, `time-point` == t & condition == c)
+    deg <- unique(subset(dat, deg == "deg")$Transcript)
+    non_deg <- unique(subset(dat, deg == "non-deg")$Transcript)
+    non_deg <- non_deg[non_deg %ni% deg]
+    
+    test_out <- list()
+    for (trait in names(genes_per_trait)) {
+      #trait <- "body height"
+      #trait <- names(genes_per_trait)[1]
+      if (length(genes_per_trait[[trait]]) != 0) {
+        test <- data.frame(
+          c(length(deg[deg %in% genes_per_trait[[trait]]]), length(non_deg[non_deg %in% genes_per_trait[[trait]]])),
+          c(length(deg[deg %ni% genes_per_trait[[trait]]]), length(non_deg[non_deg %ni% genes_per_trait[[trait]]]))
+        ) %>% fisher.test()
+        
+        test_out <- rlist::list.append(test_out, data.frame(name = trait, p = test$p.value, OR = test$estimate, OR_1 = test$conf.int[1], OR_2 = test$conf.int[2]))
+      }
+    }
+    
+    test_out <- do.call(rbind, test_out) 
+    test_out <- test_out %>% mutate(padj = p*nrow(test_out))
+    
+    gwas_test_out <- rlist::list.append(gwas_test_out, test_out)
+    names(gwas_test_out)[length(gwas_test_out)] <- paste0(c, "_", t)
+  }
+}
+gwas_test_out <- bind_rows(gwas_test_out, .id = "id")
+```
+
+Number of hits (Figure S7B)
+```{r}
+n_gwas <- gwas_test_out %>% 
+  subset(padj_add < 0.01) %>% 
+  group_by(condition, time) %>% 
+  summarize(n = n()) %>% 
+  ungroup() %>% 
+  tidyr::complete(condition, time, fill = list(n = 0))
+
+mean(subset(n_gwas, time == "4hr")$n)
+mean(subset(n_gwas, time == "24hr")$n)
+
+n_gwas %>% 
+  mutate(time = as.factor(time)) %>% 
+  mutate(time = fct_relevel(time, c("4hr", "24hr"))) %>%
+  ggplot(aes(x = condition, label = n, group = time)) +
+  geom_col(aes(y = n, fill = time), position = "dodge") +
+  #facet_grid(~time) +
+  labs(x = "Condition", y = "Hits (N)", fill = "Time point") +
+  geom_text(aes(y = n+2), size = 5, position = position_dodge(width = .9)) +
+  theme_classic() +
+  theme(text = element_text(size = 16), legend.position = "top")
+```
+
+Overlap of hits (Figure S7C)
+```{r}
+gwas_test_out_signif <- subset(gwas_test_out, padj_add < 0.01)
+venn::venn(lapply(split(gwas_test_out_signif, gwas_test_out_signif$id), function(t) return(t$name)))
+
+overlap <- UpSetR::upset(UpSetR::fromList(lapply(split(gwas_test_out_signif, gwas_test_out_signif$id), function(t) return(t$name))),
+              order.by = "freq", text.scale = 2, nsets = length(unique(gwas_test_out_signif$id)))
+```
+
+Enrichment plot (Figure S7D)
+```{r}
+gwas_test_out %>% subset(padj_add < 0.01) %>% subset(name %in% overlap_traits_all) %>% 
+  mutate(time = factor(time, levels = c("4hr", "24hr"))) %>% 
+  #melt(id.vars = c("condition", "time", "name", "padj", "OR"), measure.vars = c("OR_1", "OR_2")) %>% 
+  ggplot(aes(x = OR, y = reorder(name, OR), color = condition)) +
+  geom_errorbarh(aes(xmax = OR_1, xmin = OR_2, color = condition), linewidth = .5, height = .2, position=position_dodge(width = 0.9)) +
+  #facet_wrap(time~condition, scales = "free", nrow = 2) +
+  facet_wrap(time~., ncol = 3) +
+  geom_point(position=position_dodge(width=0.9)) +
+  geom_vline(aes(xintercept = 1), size = .25, linetype = "dashed") +
+  labs(x = "OR", y = "GWAS trait", fill = "Condition") +
+  scale_color_viridis_d() +
+  theme_classic() +
+  theme(text = element_text(size = 16))
+```
+
+# eQLTs associated with pathogen response DEGs (Figure S8A-B)
+Gathering eQTLs from DICE
+```{r}
+#The dice data is available from https://dice-database.org/#
+dice_files <- list.files(here::here("data/dice"))
+dice <- list()
+for (file in dice_files) {
+  vcf <- read.vcfR(paste0(here::here("ext_data/DICE/eqtl/"), file), verbose = FALSE )
+  t <- vcf@fix %>% as.data.frame()
+  t$gene <- sapply(t$INFO, function(x) str_split(x, ";") %>% purrr::map_chr(.,1) %>% str_split(., "=") %>% purrr::map_chr(.,2))
+  t$symbol <- sapply(t$INFO, function(x) str_split(x, ";") %>% purrr::map_chr(.,2) %>% str_split(., "=") %>% purrr::map_chr(.,2))
+  t$pvalue <- sapply(t$INFO, function(x) str_split(x, ";") %>% purrr::map_chr(.,3) %>% str_split(., "=") %>% purrr::map_chr(.,2))
+  t$beta <- sapply(t$INFO, function(x) str_split(x, ";") %>% purrr::map_chr(.,4) %>% str_split(., "=") %>% purrr::map_chr(.,2))
+  
+  dice <- rlist::list.append(dice, t)
+}
+names(dice) <- sapply(dice_files, function(x) str_split(x, "[.]") %>% purrr::map_chr(.,1))
+```
+
+Overlap (Figure S8A)
+```{r}
+dice <- readRDS(here::here("ext_data/DICE/eqtl/dice_list.rda"))
+dice_genesets <- lapply(dice, function(t) return(unique(t$symbol)))
+overlap <- UpSetR::upset(UpSetR::fromList(dice_genesets), order.by = "freq", nsets = length(dice_genesets), nintersects = 20, text.scale = 3, mb.ratio = c(0.5, 0.5))
+```
+
+Enrichment test (Figure S8B)
+```{r}
+cond <- c("LPS", "CAlb", "SAur", "PolIC")
+time <- c("4hr", "24hr")
+dice_enrichment_sep <- list()
+
+for (c in cond) {
+  # c <- "PolIC"
+  # tt <- "4hr"
+  for (tt in time) {
+    degs <- Masterfile$geneName[Masterfile$deg == "deg" & Masterfile$`time-point` == tt & Masterfile$condition == c] %>% unique()
+    non_degs <- Masterfile$geneName[Masterfile$deg == "non-deg" & Masterfile$`time-point` == tt & Masterfile$condition == c] %>% unique()
+    dice_enrichment <- list()
+    for (i in 1:length(dice)) {
+      t <- dice[[i]]
+      test <- fisher.test(
+        data.frame(
+          DE = c(length(degs[degs %in% t$symbol]), length(degs[!degs %in% t$symbol])),
+          non_DE = c(length(non_degs[non_degs %in% t$symbol]), length(non_degs[!non_degs %in% t$symbol]))
+        )
+      )
+      dice_enrichment <- rlist::list.append(dice_enrichment, test)
+    }
+    names(dice_enrichment) <- names(dice)
+    
+    
+    dice_enrichment_stats <- do.call(rbind,
+                                     lapply(dice_enrichment, 
+                                            function(t) data.frame(p_val = t$p.value, 
+                                                                   conf.int_1 = t$conf.int[1], 
+                                                                   conf.int_2 = t$conf.int[2], 
+                                                                   estimate = t$estimate))) %>% tibble::rownames_to_column("set")
+    
+    n_tests <- nrow(dice_enrichment_stats)
+    
+    out <- dice_enrichment_stats %>% 
+      mutate(padj = p_val * n_tests) %>% mutate(condition = c) %>% mutate(time_point = tt)
+    
+    dice_enrichment_sep <- rlist::list.append(dice_enrichment_sep, out)
+  }
+}
+saveRDS(dice_enrichment_sep, here::here("output/dice_enrichment_sep.rda"))
+
+
+dice_enrichment_sep_df <- do.call(rbind, dice_enrichment_sep)
+
+dice_enrichment_sep_df %>% 
+  mutate(padj = ifelse(padj > 1, 1, padj)) %>% 
+  mutate(star_pval = stars.pval(padj)) %>% 
+  mutate(star_pval = ifelse(star_pval == ".", "", star_pval)) %>% 
+  mutate(time_point = factor(time_point, levels = c("4hr", "24hr"))) %>% 
+  ggplot(aes(x = condition, y = set)) +
+  geom_tile(aes(fill = estimate)) +
+  geom_text(aes(label = star_pval), nudge_y = -0.1, size = 3) +
+  labs(x = "Stimulus", y = "eQTL cell type", fill = "OR") +
+  scale_fill_distiller(palette = "Blues", direction = 0) +
+  facet_grid(~time_point)
+```
+
+# Gene network analysis of core DEGs (Figure 3F-G)
+Performed in cytoscape, see: overlapping_degs.cys
+
+# Co-expression analysis (Figure 4C-D, S9A-G, S17A-C)
+4 hour data: prep
+```{r}
+t <- dds_4hr_t 
+pheno <- read.delim(here("seq_data/Phenodata.txt")) %>% subset(time == "4hrs") 
+name <- "both_wRPMI"
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = t, # Our prepped data frame with counts
+  colData = pheno, # Data frame with annotation for our samples
+  design = ~1 # Here we are not specifying a model
+)
+
+dds_norm_4hr <- rlog(dds)
+
+normalized_counts_4hr <- assay(dds_norm_4hr) %>%
+  t() # Transpose this data
+
+gsg <- goodSamplesGenes(normalized_counts_4hr)
+gsg$allOK == T
+```
+
+24 hour data: prep
+```{r}
+t <- dds_24hr_t 
+pheno <- read.delim(here("seq_data/Phenodata.txt")) %>% subset(time == "24hrs") 
+name <- "both_wRPMI"
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = t, # Our prepped data frame with counts
+  colData = pheno, # Data frame with annotation for our samples
+  design = ~1 # Here we are not specifying a model
+)
+
+dds_norm_24hr <- rlog(dds)
+
+normalized_counts_24hr <- assay(dds_norm_24hr) %>%
+  t() # Transpose this data
+
+gsg <-goodSamplesGenes(normalized_counts_24hr)
+gsg$allOK == T
+```
+
+Both time point: sample tree (Figure S9A)
+```{r}
+t <- dds_both 
+pheno <- read.delim(here("seq_data/Phenodata.txt"))
+name <- "both_wRPMI"
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = t, # Our prepped data frame with counts
+  colData = pheno, # Data frame with annotation for our samples
+  design = ~1 # Here we are not specifying a model
+)
+
+keep <- rowSums(counts(dds)>=1) >= 50
+dds <- dds[keep,]
+
+dds_norm_both <- rlog(dds)
+
+normalized_counts_both <- assay(dds_norm_both) %>%
+  t() # Transpose this data
+saveRDS(normalized_counts_both, here::here("co-expression/output/normalized_counts_both.rda"))
+
+gsg <-goodSamplesGenes(normalized_counts_both)
+gsg$allOK == T
+
+sampleTree <- hclust(dist(normalized_counts_both), method = "average")
+
+plot(sampleTree, main = "", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+plot(sampleTree, main = "", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+4 hour data: sample tree (Figure S9B)
+```{r}
+normalized_counts_4hr <- readRDS(here::here("co-expression/output/normalized_counts_4hr.rda"))
+sampleTree <- hclust(dist(normalized_counts_4hr), method = "average")
+plot(sampleTree, main = "", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+24 hour data: sample tree (Figure S9C)
+```{r}
+normalized_counts_24hr <- readRDS(here::here("co-expression/output/normalized_counts_24hr.rda"))
+sampleTree <- hclust(dist(normalized_counts_24hr), method = "average")
+plot(sampleTree, main = "", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+```
+
+Selecting a soft cutoff (Figure S9D-G)
+```{r}
+spt_4hr <- pickSoftThreshold(normalized_counts_4hr, dataIsExpr = TRUE, corFnc = cor, networkType = "signed")
+spt_24hr <- pickSoftThreshold(normalized_counts_24hr, dataIsExpr = TRUE, corFnc = cor, networkType = "signed")
+
+soft_threshold_4hr <- spt_4hr$fitIndices %>% 
+  ggplot(aes(x = Power, y = `SFT.R.sq`, label = Power)) +
+  geom_text() +
+  labs(x="Soft Threshold (power)", y="Scale Free Topology Model Fit,signed R^2") +
+  ggtitle("4hr soft threshold choice") +
+  geom_hline(yintercept=0.8, color = "red", linewidth=1)
+
+soft_threshold_24hr <- spt_24hr$fitIndices %>% 
+  ggplot(aes(x = Power, y = `SFT.R.sq`, label = Power)) +
+  geom_text() +
+  labs(x="Soft Threshold (power)", y="Scale Free Topology Model Fit,signed R^2") +
+  ggtitle("24hr soft threshold choice") +
+  geom_hline(yintercept=0.8, color = "red", linewidth=1)
+
+connectivity_4hr <- spt_4hr$fitIndices %>% 
+  ggplot(aes(x = Power, y = `mean.k.`, label = Power)) +
+  geom_text() +
+  labs(x="Soft Threshold (power)", y="Mean Connectivity") +
+  ggtitle("4hr connectivity") 
+
+connectivity_24hr <- spt_24hr$fitIndices %>% 
+  ggplot(aes(x = Power, y = `mean.k.`, label = Power)) +
+  geom_text() +
+  labs(x="Soft Threshold (power)", y="Mean Connectivity") +
+  ggtitle("24hr connectivity") 
+
+ggarrange(
+  soft_threshold_4hr, soft_threshold_24hr,
+  connectivity_4hr, connectivity_24hr
+)
+```
+
+Generating the network modules: 4 hours
+```{r}
+normalized_counts_4hr <- readRDS(here::here("co-expression/output/normalized_counts_4hr.rda"))
+bwnet_4hr <- blockwiseModules(normalized_counts_4hr,
+  maxBlockSize = 5000, # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = 5, # soft threshold for network construction
+  numericLabels = FALSE,
+  minModuleSize = 30,
+  mergeCutHeight = 0.25,
+  deepSplit = 2,
+  randomSeed = 1234 # set a seed
+)
+
+gprof_4hr_modules <- list()
+for (colour in unique(gene_module_key_4hr$module)) {
+  go <- gprofiler2::gost(query = gene_module_key_4hr$gene[gene_module_key_4hr$module == colour], 
+                         organism = "hsapiens", ordered_query = FALSE, 
+                         multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                         measure_underrepresentation = FALSE, evcodes = FALSE, 
+                         user_threshold = 0.05, correction_method = "g_SCS", 
+                         domain_scope = "annotated", custom_bg = NULL, 
+                         numeric_ns = "", sources = NULL, as_short_link = FALSE)
+  if (!is.null(go)) {
+      gprof_4hr_modules <- rlist::list.append(gprof_4hr_modules, go$result)
+      if (is.null(names(gprof_4hr_modules))) {
+        names(gprof_4hr_modules) <- colour
+      } else {
+        names(gprof_4hr_modules)[length(names(gprof_4hr_modules))] <- colour 
+      }
+  }
+}
+gprof_4hr_modules <- do.call(rbind, Map(cbind, gprof_4hr_modules, module=names(gprof_4hr_modules)))
+```
+
+Generating the network modules: 24 hours
+```{r}
+normalized_counts_24hr <- readRDS(here::here("output/normalized_counts_24hr.rda"))
+bwnet_24hr <- blockwiseModules(normalized_counts_24hr,
+  maxBlockSize = 5000, # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = 10, # soft threshold for network construction
+  numericLabels = FALSE,
+  minModuleSize = 30,
+  mergeCutHeight = 0.25,
+  deepSplit = 2,
+  randomSeed = 1234 # set a seed
+)
+
+gene_module_key_24hr <- tibble::enframe(bwnet_24hr$colors, name = "gene", value = "module") %>%
+  # Let's add the `ME` part so its more clear what these numbers are and it matches elsewhere
+  dplyr::mutate(module = paste0("ME", module))
+
+gprof_24hr_modules <- list()
+for (colour in unique(gene_module_key_24hr$module)) {
+  go <- gprofiler2::gost(query = gene_module_key_24hr$gene[gene_module_key_24hr$module == colour], 
+                         organism = "hsapiens", ordered_query = FALSE, 
+                         multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                         measure_underrepresentation = FALSE, evcodes = FALSE, 
+                         user_threshold = 0.05, correction_method = "g_SCS", 
+                         domain_scope = "annotated", custom_bg = NULL, 
+                         numeric_ns = "", sources = NULL, as_short_link = FALSE)
+  if (!is.null(go)) {
+      gprof_24hr_modules <- rlist::list.append(gprof_24hr_modules, go$result)
+      if (is.null(names(gprof_24hr_modules))) {
+        names(gprof_24hr_modules) <- colour
+      } else {
+        names(gprof_24hr_modules)[length(names(gprof_24hr_modules))] <- colour 
+      }
+  }
+}
+gprof_24hr_modules <- do.call(rbind, Map(cbind, gprof_24hr_modules, module=names(gprof_24hr_modules)))
+```
+
+GSEA using WGCNA modules (Figure 4C)
+```{r}
+WGCNAtoGSEA <- function(t, test, control, pathways, gsea_name) {
+  df <- t %>% 
+    results(contrast = c("group", test, control)) %>% 
+    as.matrix()
+  
+  names <- rownames(df)
+  rownames(df) <- NULL
+  df <- cbind(names, df) %>% as.data.frame()
+  df$stat <- as.numeric(df$stat)
+  
+  ranks <- df %>% dplyr::select(names, stat) %>% na.omit() %>% dplyr::distinct() %>% deframe() 
+  
+  fgseaRes <- fgsea::fgsea(pathways = pathways, 
+                           stats = ranks, 
+                           eps = 0)
+
+  
+  fgseaResTidy <- fgseaRes %>%
+    as_tibble() %>%
+    arrange(desc(NES))
+  
+  table <- fgseaResTidy %>% 
+    dplyr::select(pathway, pval, padj, log2err, ES, NES, size) %>% 
+    arrange(padj)
+  return(table)
+}
+
+gene_module_4hr_list <- gene_module_key_4hr %>% group_by(module) %>% split(gene_module_key_4hr$module)
+names(gene_module_4hr_list) <- sapply(names(gene_module_4hr_list), function(t) paste0(t, "_", "4hr"))
+gene_module_24hr_list <- gene_module_key_24hr %>% group_by(module) %>% split(gene_module_key_24hr$module)
+names(gene_module_24hr_list) <- sapply(names(gene_module_24hr_list), function(t) paste0(t, "_", "24hr"))
+
+pathways = lapply(gene_module_4hr_list, function(t) return(t$gene))
+  
+wgcna_4hr_lps_4hr_modules <- WGCNAtoGSEA(dds_4hr, test = "LPS", control = "RPMI", gsea_name = "gsea_4hr", pathways = pathways)
+wgcna_4hr_calb_4hr_modules <- WGCNAtoGSEA(dds_4hr, test = "C_Albicans", control = "RPMI", gsea_name = "gsea_4hr", pathways = pathways)
+wgcna_4hr_saur_4hr_modules <- WGCNAtoGSEA(dds_4hr, test = "S_Aureus", control = "RPMI", gsea_name = "gsea_4hr", pathways = pathways)
+wgcna_4hr_polic_4hr_modules <- WGCNAtoGSEA(dds_4hr, test = "PolyIC", control = "RPMI", gsea_name = "gsea_4hr", pathways = pathways)
+
+
+pathways = lapply(gene_module_24hr_list, function(t) return(t$gene))
+
+wgcna_24hr_lps_24hr_modules <- WGCNAtoGSEA(dds_24hr, test = "LPS", control = "RPMI", gsea_name = "gsea_24hr", pathways = pathways)
+wgcna_24hr_calb_24hr_modules <- WGCNAtoGSEA(dds_24hr, test = "C_Albicans", control = "RPMI", gsea_name = "gsea_24hr", pathways = pathways)
+wgcna_24hr_saur_24hr_modules <- WGCNAtoGSEA(dds_24hr, test = "S_Aureus", control = "RPMI", gsea_name = "gsea_24hr", pathways = pathways)
+wgcna_24hr_polic_24hr_modules <- WGCNAtoGSEA(dds_24hr, test = "PolyIC", control = "RPMI", gsea_name = "gsea_24hr", pathways = pathways)
+
+wgcna_gsea <- list(
+  wgcna_4hr_lps_4hr_modules, wgcna_4hr_calb_4hr_modules, wgcna_4hr_saur_4hr_modules, wgcna_4hr_polic_4hr_modules,
+  wgcna_24hr_lps_24hr_modules, wgcna_24hr_calb_24hr_modules, wgcna_24hr_saur_24hr_modules, wgcna_24hr_polic_24hr_modules
+)
+names(wgcna_gsea)
+names(wgcna_gsea) <- c("wgcna_4hr_lps_4hr_modules", "wgcna_4hr_calb_4hr_modules", "wgcna_4hr_saur_4hr_modules", "wgcna_4hr_polic_4hr_modules", 
+                       "wgcna_24hr_lps_24hr_modules", "wgcna_24hr_calb_24hr_modules", "wgcna_24hr_saur_24hr_modules", "wgcna_24hr_polic_24hr_modules")
+
+map_df(wgcna_gsea, ~as.data.frame(.x), .id="id") %>% 
+  mutate(time_dds = stringr::str_split(id, "_") %>% purrr::map_chr(.,2)) %>% 
+  mutate(condition_dds = stringr::str_split(id, "_") %>% purrr::map_chr(.,3)) %>% 
+  mutate(modules_time = stringr::str_split(id, "_") %>% purrr::map_chr(.,4)) %>% 
+  subset(time_dds == modules_time) %>% 
+  mutate(p_star = stars.pval(padj)) %>% 
+  ggplot(aes(x = id, y = pathway, fill = NES, label = p_star)) +
+  geom_tile() +
+  geom_text() +
+  facet_wrap(~modules_time, scales = "free") +
+  scale_fill_distiller(type = "div", palette = 4) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+        text = element_text(size = 21))
+```
+
+Functional enrichment of gene modules (Figure 4D)
+```{r}
+go <- gprofiler2::gost(query = gene_module_key_4hr$gene[gene_module_key_4hr$module == "MEred"], 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = NULL, as_short_link = FALSE)
+go$result %>% 
+  subset(term_size >= 100 & term_size <= 500) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(fill = source, x = -log10(p_value), y =reorder(term_name, -log10(p_value)))) +
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ggtitle("MEred_4hr")
+
+go <- gprofiler2::gost(query = gene_module_key_4hr$gene[gene_module_key_4hr$module == "MEgreen"], 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = NULL, as_short_link = FALSE)
+go$result %>% 
+  subset(term_size >= 100 & term_size <= 500) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(fill = source, x = -log10(p_value), y =reorder(term_name, -log10(p_value)))) +
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ggtitle("MEgreen_4hr")
+
+go <- gprofiler2::gost(query = gene_module_key_24hr$gene[gene_module_key_24hr$module == "MEyellow"], 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = NULL, as_short_link = FALSE)
+go$result %>% 
+  subset(term_size >= 100 & term_size <= 500) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(fill = source, x = -log10(p_value), y =reorder(term_name, -log10(p_value)))) +
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ggtitle("MEyellow_24hr")
+
+go <- gprofiler2::gost(query = gene_module_key_24hr$gene[gene_module_key_24hr$module == "MEred"], 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = NULL, as_short_link = FALSE)
+go$result %>% 
+  subset(term_size >= 100 & term_size <= 500) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(fill = source, x = -log10(p_value), y =reorder(term_name, -log10(p_value)))) +
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ggtitle("MEred_24hr")
+
+go <- gprofiler2::gost(query = gene_module_key_24hr$gene[gene_module_key_24hr$module == "MEgreen"], 
+                       organism = "hsapiens", ordered_query = FALSE, 
+                       multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                       measure_underrepresentation = FALSE, evcodes = FALSE, 
+                       user_threshold = 0.05, correction_method = "g_SCS", 
+                       domain_scope = "annotated", custom_bg = NULL, 
+                       numeric_ns = "", sources = NULL, as_short_link = FALSE)
+go$result %>% 
+  subset(term_size >= 100 & term_size <= 500) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(fill = source, x = -log10(p_value), y =reorder(term_name, -log10(p_value)))) +
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ggtitle("MEgreen_24hr")
+```
+
+Number of genes per module (Figure S17A)
+```{r}
+rbind(
+  gene_module_key_4hr %>% group_by(module) %>% summarize(n = n()) %>% mutate(time = "4hr"),
+  gene_module_key_24hr %>% group_by(module) %>% summarize(n = n()) %>% mutate(time = "24hr")
+) %>% 
+  mutate(color = str_split(module, "ME") %>% map_chr(.,2)) %>%
+  mutate(time = as.factor(time)) %>% 
+  mutate(time = fct_relevel(time, c("4hr", "24hr"))) %>%
+  ggplot(aes(x = module, y = n, label = n)) +
+  facet_grid(~time) +
+  labs(y = "Genes (N)", x = "WGCNA gene module") +
+  geom_col(aes(fill = color)) +
+  geom_text(nudge_y = 60, size = 5) +
+  scale_fill_identity() +
+  theme_bw() +
+  theme(text = element_text(size = 16))
+```
+
+Functional enrichment of 4hr gene modules (Figure S17B)
+```{r}
+gprof_4hr_modules <- list()
+for (colour in unique(gene_module_key_4hr$module)) {
+  go <- gprofiler2::gost(query = gene_module_key_4hr$gene[gene_module_key_4hr$module == colour], 
+                         organism = "hsapiens", ordered_query = FALSE, 
+                         multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                         measure_underrepresentation = FALSE, evcodes = FALSE, 
+                         user_threshold = 0.05, correction_method = "g_SCS", 
+                         domain_scope = "annotated", custom_bg = NULL, 
+                         numeric_ns = "", sources = NULL, as_short_link = FALSE)
+  if (!is.null(go)) {
+      gprof_4hr_modules <- rlist::list.append(gprof_4hr_modules, go$result)
+      if (is.null(names(gprof_4hr_modules))) {
+        names(gprof_4hr_modules) <- colour
+      } else {
+        names(gprof_4hr_modules)[length(names(gprof_4hr_modules))] <- colour 
+      }
+  }
+}
+gprof_4hr_modules <- do.call(rbind, Map(cbind, gprof_4hr_modules, module=names(gprof_4hr_modules)))
+
+gprof_4hr_modules %>% subset(term_size > 100 & term_size < 500) %>% mutate(time = "4hr") %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC", "REAC", "CORUM", "HPA", "KEGG")) %>% 
+  mutate(log10p = -log10(p_value)) %>% 
+  ggplot(aes(y = tidytext::reorder_within(term_name, log10p, within = module), x = log10p, fill = source)) +
+  geom_col() +
+  ggtitle("WGCNA modules using 4hr stimulation data") +
+  labs(x = "-log10(P)", y = "Gene set", fill = "Gene set source") +
+  tidytext::scale_y_reordered() +
+  ggh4x::facet_grid2(module~time, scales = "free_y", space = "free_y")
+```
+
+Functional enrichment of 4hr gene modules (Figure S17C)
+```{r}
+gprof_24hr_modules <- list()
+for (colour in unique(gene_module_key_24hr$module)) {
+  go <- gprofiler2::gost(query = gene_module_key_24hr$gene[gene_module_key_24hr$module == colour], 
+                         organism = "hsapiens", ordered_query = FALSE, 
+                         multi_query = FALSE, significant = T, exclude_iea = FALSE, 
+                         measure_underrepresentation = FALSE, evcodes = FALSE, 
+                         user_threshold = 0.05, correction_method = "g_SCS", 
+                         domain_scope = "annotated", custom_bg = NULL, 
+                         numeric_ns = "", sources = NULL, as_short_link = FALSE)
+  if (!is.null(go)) {
+      gprof_24hr_modules <- rlist::list.append(gprof_24hr_modules, go$result)
+      if (is.null(names(gprof_24hr_modules))) {
+        names(gprof_24hr_modules) <- colour
+      } else {
+        names(gprof_24hr_modules)[length(names(gprof_24hr_modules))] <- colour 
+      }
+  }
+}
+gprof_24hr_modules <- do.call(rbind, Map(cbind, gprof_24hr_modules, module=names(gprof_24hr_modules)))
+
+gprof_24hr_modules %>% subset(term_size > 100 & term_size < 500) %>% mutate(time = "24hr") %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC", "REAC", "CORUM", "HPA", "KEGG")) %>% 
+  mutate(log10p = -log10(p_value)) %>% 
+  subset(source %in% c("GO:BP", "GO:MF", "GO:CC")) %>% 
+  ggplot(aes(y = tidytext::reorder_within(term_name, log10p, within = module), x = log10p, fill = source)) +
+  geom_col() +
+  ggtitle("WGCNA modules using 24hr stimulation data") +
+  labs(x = "-log10(P)", y = "Gene set", fill = "Gene set source") +
+  tidytext::scale_y_reordered() +
+  ggh4x::facet_grid2(module~time, scales = "free_y", space = "free_y")
+```
+
+Gene networks (Figure 4D)
+Figure produced in cytoscape, see: wgcna_correlations.cys
+```{r}
+networks_filtered <- list.files(here::here("co-expression/output/networks/"), "filtered.tsv")
+networks <- list.files(here::here("co-expression/output/networks/"), ".tsv")
+networks_raw <- networks[networks %ni% networks_filtered]
+
+hist(yellow_4hr$correlation)
+subset(yellow_4hr, correlation > 0.05)$gene1 %>% unique() %>% length()
+
+gene_module_key_4hr$module[gene_module_key_4hr$gene %in% unchar_degs_ens] %>% unique()
+
+#I want to get the uncharacterized genes too
+any(unchar_degs_ens %in% unique(subset(yellow_4hr, correlation > 0.02)$gene1))
+subset(subset(yellow_4hr, correlation > 0.02), gene1 %in% unchar_degs_ens)$gene1 %>% unique() 
+#There are two uncharacterized genes in there
+
+gprofiler2::gconvert(unique(subset(yellow_4hr, correlation > 0.02)$gene1))$name %>% unique() %>% clipr::write_clip()
+
+#These are the genenames of the unchar genes in this module
+gprofiler2::gconvert(subset(yellow_4hr, gene1 %in% unchar_degs_ens)$gene1)$name %>% unique() 
+gprofiler2::gconvert(subset(yellow_4hr, correlation > 0.02 & gene1 %in% unchar_degs_ens)$gene1)$name %>% unique() 
+
+out <- subset(yellow_4hr, correlation > 0.02)
+```
+
+Example DEGs log2foldchange (Figure 4E)
+```{r}
+example <- Masterfile %>% mutate(star_p = stars.pval(padj)) %>% mutate(star_p = ifelse(padj > 0.05 | is.na(padj), "ns", star_p)) %>% mutate(`time-point` = factor(`time-point`, levels = c("4hr", "24hr"))) %>% 
+  subset(geneName %in% c("KIAA0040", "FAM49A")) %>% 
+  mutate(ci_1 = log2FoldChange-lfcSE, ci_2 = log2FoldChange+lfcSE) %>% 
+    mutate(condition = ifelse(condition == "CAlb", glue("<i>C. albicans<i>"), 
+                            ifelse(condition == "SAur", glue("<i>S. aureus<i>"), 
+                                   ifelse(condition == "PolIC", "Poly(I:C)",
+                                          ifelse(condition == "LPS", "LPS", condition))))) %>% 
+  mutate(geneName = ifelse(geneName == "FAM49A", glue("<i>FAM49A<i>"),
+                           ifelse(geneName == "KIAA0040", glue("<i>KIAA0040<i>"), geneName)))
+
+example$condition <- factor(example$condition, 
+                            levels = c("LPS", "<i>C. albicans<i>", "Poly(I:C)", "<i>S. aureus<i>"))
+
+example %>% 
+  ggplot(aes(y = `time-point`, label = paste0("LFC=", round(log2FoldChange, 2), "; p=", scientific(pvalue, digits = 2)))) +
+  geom_point(aes(x = log2FoldChange, color = `time-point`), size = 2, position=position_dodge(width = 0.9), stat = "identity")  +
+  labs(x = "Log2FoldChange", y = "Time-point", color = "Time-point") +
+  geom_errorbarh(aes(xmax = ci_1, xmin = ci_2, color = `time-point`), 
+                 linewidth = .5, height = .1, position=position_dodge(width = 0.9)) +
+  geom_text(aes(x = 1),nudge_y = 0.25, nudge_x = 0, size = 1.7) +
+  facet_grid(geneName~condition) +
+  theme_bw() +
+  theme(strip.text = ggtext::element_markdown())
+```
+
+# Cell-type level expression of uncharacterized genes (Figure S18A-D)
+CELLxGENE data (Figure S18A)
+```{r}
+#The cellxgene data is available at https://cellxgene.cziscience.com/gene-expressions
+cxg_example <- read.csv(here::here("ext_data/cellxgene/CELLxGENE_gene_expression_090924.csv"), skip = 9) 
+rownames(cxg_example) <- NULL
+colnames(cxg_example) <- c("Tissue", "Cell_type", "Cell_count", "Tissue_comp", "Gene", "Expression", "Scaled_expression", "N_cells_expression")
+
+cxg_example <- cxg_example %>% mutate(Perc_express = N_cells_expression / Cell_count)
+
+cxg_example %>% 
+  subset(Tissue == "blood") %>% 
+  subset(Cell_count > 10^5) %>% 
+  subset(!Cell_type %in% c("cell")) %>% 
+  subset(Gene %in% c("KIAA0040", "CYRIA")) %>% 
+  ggplot(aes(x = Gene, y = tidytext::reorder_within(Cell_type, Scaled_expression, within = Gene), 
+             color = Scaled_expression, size = Perc_express)) + 
+  geom_point() +
+  tidytext::scale_y_reordered() +
+  labs(x = "Gene", y = "Cell type", fill = "Gene expression", size = "Expressed in cells (%)") +
+  facet_wrap(~Gene, scales = "free") +
+  scale_color_viridis_c(option = "inferno", begin = 1, end = 0, limits = c(0, 1)) + 
+  theme_classic() +
+  theme(text = element_text(size = 16))
+```
+
+HPA immune (Figure S18B)
+```{r}
+#The hpa dataset is available at https://www.proteinatlas.org/about/download
+hpa_immu <- read_tsv(here::here("ext_data/human_protein_atlas/immune/rna_immune_cell.tsv"))
+hpa_immu %>% subset(`Gene name` %in% c("KIAA0040", "CYRIA")) %>% 
+  subset(`Immune cell` != "total PBMC") %>% 
+  mutate(`Gene name` = factor(`Gene name`, levels = c("KIAA0040", "CYRIA"))) %>% 
+  ggplot(aes(y = tidytext::reorder_within(`Immune cell`, -pTPM, within = `Gene name`), x = pTPM)) +
+  geom_col() +
+  labs(y = "Cell type") +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~`Gene name`, scales = "free") +
+  ggtitle("HPA immune") +
+  theme_classic() +
+  theme(text = element_text(size = 16))
+```
+
+Monaco dataset (Figure S18C)
+```{r}
+#The monaco dataset is available from PMID: 30726743
+monaco <- read_tsv(here::here("ext_data/human_protein_atlas/immune/rna_immune_cell_monaco.tsv"))
+monaco %>% subset(`Gene name` %in% c("KIAA0040", "CYRIA")) %>% 
+  mutate(`Gene name` = factor(`Gene name`, levels = c("KIAA0040", "CYRIA"))) %>% 
+  subset(`Immune cell` != "total PBMC") %>% 
+  ggplot(aes(y = tidytext::reorder_within(`Immune cell`, -pTPM, within = `Gene name`), x = pTPM)) +
+  geom_col() +
+  labs(y = "Cell type") +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~`Gene name`, scales = "free") +
+  ggtitle("Monaco et al.") +
+  theme_classic() +
+  theme(text = element_text(size = 16))
+```
+
+Schmiedel dataset (Figure S18D)
+```{r}
+#The schmiedel dataset is available from PMID: 30449622
+schmiedel <- read_tsv(here::here("ext_data/human_protein_atlas/immune/rna_immune_cell_schmiedel.tsv"))
+schmiedel %>% subset(`Gene name` %in% c("KIAA0040", "CYRIA")) %>% 
+  mutate(`Gene name` = factor(`Gene name`, levels = c("KIAA0040", "CYRIA"))) %>% 
+  subset(`Immune cell` != "total PBMC") %>% 
+  ggplot(aes(y = tidytext::reorder_within(`Immune cell`, -TPM, within = `Gene name`), x = TPM)) +
+  geom_col() +
+  labs(y = "Cell type") +
+  tidytext::scale_y_reordered() +
+  facet_wrap(~`Gene name`, scales = "free") +
+  ggtitle("Schmiedel et al.") +
+  theme_classic() +
+  theme(text = element_text(size = 16))
+```
+
+# Co-expression from published data (Figure S19A-B)
+```{r}
+TERM2GENE <- correlationAnalyzeR::getTERM2GENE(GSEA_Type = c("GO:BP")) 
+pathways <- split(TERM2GENE, TERM2GENE$gs_name)
+pathways <- lapply(pathways, function(t) return(t$gene_symbol))
+
+
+gene <- "KIAA0040"
+gene <- "FAM49A"
+
+output <- correlationAnalyzeR::analyzeSingleGenes(gene, topPlots = F)
+corr <- output$correlations %>% tibble::deframe()
+names(corr) <- rownames(output$`P values`)
+fgseaRes <- fgsea::fgsea(pathways = pathways, 
+                  stats = corr,
+                  min = 100,
+                  max = 500)
+
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp)
+fgsea::plotGseaTable(pathways[topPathways], corr, fgseaRes, 
+              gseaParam=0.5)
+```
